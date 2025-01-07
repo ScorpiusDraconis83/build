@@ -88,7 +88,8 @@ var (
 //	26: clean up path validation and normalization
 //	27: export GOPLSCACHE=$workdir/goplscache
 //	28: add support for gomote server
-const buildletVersion = 28
+//	29: fall back to /bin/sh when SHELL is unset
+const buildletVersion = 29
 
 func defaultListenAddr() string {
 	if runtime.GOOS == "darwin" {
@@ -127,6 +128,7 @@ const (
 	metaKeyPassword = "password"
 	metaKeyTLSCert  = "tls-cert"
 	metaKeyTLSkey   = "tls-key"
+	windowsWorkdir  = `C:\workdir`
 )
 
 func main() {
@@ -198,7 +200,7 @@ func main() {
 		case "windows":
 			// We want a short path on Windows, due to
 			// Windows issues with maximum path lengths.
-			*workDir = `C:\workdir`
+			*workDir = windowsWorkdir
 			if err := os.MkdirAll(*workDir, 0755); err != nil {
 				log.Fatalf("error creating workdir: %v", err)
 			}
@@ -2038,6 +2040,9 @@ func shell() string {
 	case "windows":
 		return `C:\Windows\System32\cmd.exe`
 	default:
-		return os.Getenv("SHELL")
+		if shell := os.Getenv("SHELL"); shell != "" {
+			return shell
+		}
+		return "/bin/sh"
 	}
 }

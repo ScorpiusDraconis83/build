@@ -659,7 +659,7 @@ func (c *Client) ListReviewers(ctx context.Context, changeID string) ([]Reviewer
 
 // HashtagsInput is the request body used when modifying a CL's hashtags.
 //
-// See https://gerrit-documentation.storage.googleapis.com/Documentation/2.15.1/rest-api-changes.html#hashtags-input
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#hashtags-input
 type HashtagsInput struct {
 	Add    []string `json:"add"`
 	Remove []string `json:"remove"`
@@ -669,7 +669,7 @@ type HashtagsInput struct {
 // and removing hashtags in one request. On success it returns the new
 // set of hashtags.
 //
-// See https://gerrit-documentation.storage.googleapis.com/Documentation/2.15.1/rest-api-changes.html#set-hashtags
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#set-hashtags
 func (c *Client) SetHashtags(ctx context.Context, changeID string, hashtags HashtagsInput) ([]string, error) {
 	var res []string
 	err := c.do(ctx, &res, "POST", fmt.Sprintf("/changes/%s/hashtags", changeID), reqBodyJSON{&hashtags})
@@ -688,11 +688,18 @@ func (c *Client) RemoveHashtags(ctx context.Context, changeID string, tags ...st
 
 // GetHashtags returns a CL's current hashtags.
 //
-// See https://gerrit-documentation.storage.googleapis.com/Documentation/2.15.1/rest-api-changes.html#get-hashtags
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#get-hashtags
 func (c *Client) GetHashtags(ctx context.Context, changeID string) ([]string, error) {
 	var res []string
 	err := c.do(ctx, &res, "GET", fmt.Sprintf("/changes/%s/hashtags", changeID))
 	return res, err
+}
+
+// DeleteTopic deletes the topic of a change.
+//
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-changes.html#delete-topic.
+func (c *Client) DeleteTopic(ctx context.Context, changeID string) error {
+	return c.do(ctx, nil, "DELETE", "/changes/"+changeID+"/topic", wantResStatus(http.StatusNoContent))
 }
 
 // AbandonChange abandons the given change.
@@ -837,6 +844,14 @@ type BranchInfo struct {
 	CanDelete bool   `json:"can_delete"`
 }
 
+// The BranchInput entity contains information for the creation of a new branch.
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-projects.html#branch-input
+type BranchInput struct {
+	Ref      string `json:"ref,omitempty"`
+	Revision string `json:"revision,omitempty"`
+	// ValidationOptions is optional.
+}
+
 // GetProjectBranches returns the branches for the project name. The branches are stored in a map
 // keyed by reference.
 func (c *Client) GetProjectBranches(ctx context.Context, name string) (map[string]BranchInfo, error) {
@@ -852,12 +867,30 @@ func (c *Client) GetProjectBranches(ctx context.Context, name string) (map[strin
 	return m, nil
 }
 
+// ListBranches lists all branches in the project.
+//
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-projects.html#list-branches.
+func (c *Client) ListBranches(ctx context.Context, project string) ([]BranchInfo, error) {
+	var res []BranchInfo
+	err := c.do(ctx, &res, "GET", fmt.Sprintf("/projects/%s/branches", url.PathEscape(project)))
+	return res, err
+}
+
 // GetBranch gets a particular branch in project.
 //
 // See https://gerrit-review.googlesource.com/Documentation/rest-api-projects.html#get-branch.
 func (c *Client) GetBranch(ctx context.Context, project, branch string) (BranchInfo, error) {
 	var res BranchInfo
 	err := c.do(ctx, &res, "GET", fmt.Sprintf("/projects/%s/branches/%s", url.PathEscape(project), branch))
+	return res, err
+}
+
+// CreateBranch create a new branch in the project.
+//
+// See https://gerrit-review.googlesource.com/Documentation/rest-api-projects.html#create-branch
+func (c *Client) CreateBranch(ctx context.Context, project, branch string, input BranchInput) (BranchInfo, error) {
+	var res BranchInfo
+	err := c.do(ctx, &res, "PUT", fmt.Sprintf("/projects/%s/branches/%s", url.PathEscape(project), url.PathEscape(branch)), reqBodyJSON{&input}, wantResStatus(http.StatusCreated))
 	return res, err
 }
 

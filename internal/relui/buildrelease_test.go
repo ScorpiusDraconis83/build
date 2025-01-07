@@ -27,9 +27,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/google/go-github/github"
 	"github.com/google/uuid"
-	"github.com/shurcooL/githubv4"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal"
 	"golang.org/x/build/internal/gcsfs"
@@ -38,21 +36,18 @@ import (
 	"golang.org/x/build/internal/workflow"
 )
 
-func TestNonDistpack(t *testing.T) {
-	t.Run("minor", func(t *testing.T) {
-		testRelease(t, "go1.20", 20, "go1.20.1", task.KindMinor)
-	})
-}
-
 func TestRelease(t *testing.T) {
+	t.Run("minor", func(t *testing.T) {
+		testRelease(t, "go1.22", 22, "go1.22.1", task.KindMinor)
+	})
 	t.Run("beta", func(t *testing.T) {
-		testRelease(t, "go1.20", 21, "go1.21beta1", task.KindBeta)
+		testRelease(t, "go1.22", 23, "go1.23beta1", task.KindBeta)
 	})
 	t.Run("rc", func(t *testing.T) {
-		testRelease(t, "go1.20", 21, "go1.21rc1", task.KindRC)
+		testRelease(t, "go1.22", 23, "go1.23rc1", task.KindRC)
 	})
 	t.Run("major", func(t *testing.T) {
-		testRelease(t, "go1.20", 21, "go1.21.0", task.KindMajor)
+		testRelease(t, "go1.22", 23, "go1.23.0", task.KindMajor)
 	})
 }
 
@@ -68,20 +63,6 @@ func TestSecurity(t *testing.T) {
 const fakeGo = `#!/bin/bash -eu
 
 case "$1" in
-"run")
-  case "$2" in
-  "releaselet.go")
-    # We're building an MSI. The command should be run in the gomote work dir.
-    ls go/src/make.bash >/dev/null
-    mkdir msi
-    echo "I'm an MSI!" > msi/thisisanmsi.msi
-    ;;
-  *)
-    echo "unknown main file $2"
-    exit 1
-    ;;
-  esac
-  ;;
 "get")
   ls go.mod go.sum >/dev/null
   for i in "${@:2}"; do
@@ -94,8 +75,8 @@ case "$1" in
   echo "tidied!" >> go.mod
   ;;
 "generate")
-  mkdir -p internal/imports
-  cd internal/imports && echo "package imports" >> zstdlib.go
+  mkdir -p internal/stdlib
+  cd internal/stdlib && echo "package stdlib" >> manifest.go
   ;;
 *)
   echo unexpected command $@
@@ -107,7 +88,6 @@ esac
 type releaseTestDeps struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
-	buildlets      *task.FakeBuildlets
 	buildBucket    *task.FakeBuildBucketClient
 	goRepo         *task.FakeRepo
 	gerrit         *reviewerCheckGerrit
@@ -128,48 +108,6 @@ func newReleaseTestDeps(t *testing.T, previousTag string, major int, wantVersion
 	// Set up a server that will be used to serve inputs to the build.
 	bootstrapServer := httptest.NewServer(http.HandlerFunc(serveBootstrap))
 	t.Cleanup(bootstrapServer.Close)
-	fakeBuildlets := task.NewFakeBuildlets(t, bootstrapServer.URL, map[string]string{
-		"pkgbuild": `#!/bin/bash -eu
-case "$@" in
-"--identifier=org.golang.go --version ` + wantVersion + ` --scripts=pkg-scripts --root=pkg-root pkg-intermediate/org.golang.go.pkg")
-	# We're doing an intermediate step in building a PKG.
-	echo "I'm an intermediate PKG!" > "$6"
-	tar -cz -C pkg-root . >> "$6"
-	;;
-*)
-	echo "unexpected command $@"
-	exit 1
-	;;
-esac
-`,
-		"productbuild": `#!/bin/bash -eu
-case "$@" in
-"--distribution=pkg-distribution --resources=pkg-resources --package-path=pkg-intermediate pkg-out/` + wantVersion + `.pkg")
-	# We're building a PKG.
-	ls pkg-distribution pkg-resources/bg-light.png pkg-resources/bg-dark.png >/dev/null
-	cat pkg-intermediate/* | head -n 1 | sed "s/an intermediate PKG/a PKG/" > "$4"
-	cat pkg-intermediate/* | tail -n +2 >> "$4"
-	;;
-*)
-	echo "unexpected command $@"
-	exit 1
-	;;
-esac
-`,
-		"pkgutil": `#!/bin/bash -eu
-case "$@" in
-"--expand-full go.pkg pkg-expanded")
-	# We're expanding a PKG.
-	mkdir -p "$3/org.golang.go.pkg/Payload/usr/local/go"
-	tail -n +2 "$2" | tar -xz -C "$3/org.golang.go.pkg/Payload"
-	;;
-*)
-	echo "unexpected command $@"
-	exit 1
-	;;
-esac
-`,
-	})
 
 	// Set up the fake CDN publishing process.
 	servingDir := t.TempDir()
@@ -205,11 +143,14 @@ esac
 	gerrit := &reviewerCheckGerrit{FakeGerrit: fakeGerrit}
 	versionTasks := &task.VersionTasks{
 		Gerrit:     gerrit,
-		CloudBuild: task.NewFakeCloudBuild(t, fakeGerrit, "", nil, fakeGo),
+		CloudBuild: task.NewFakeCloudBuild(t, fakeGerrit, "", nil, task.FakeBinary{Name: "go", Implementation: fakeGo}),
 		GoProject:  "go",
 	}
 	milestoneTasks := &task.MilestoneTasks{
-		Client:    fakeGitHub{},
+		Client: &task.FakeGitHub{
+			Milestones:       map[int]string{0: "Go1.18", 1: "Go1.23", 2: "Go1.22.1"},
+			DisallowComments: true,
+		},
 		RepoOwner: "golang",
 		RepoName:  "go",
 		ApproveAction: func(ctx *workflow.TaskContext) error {
@@ -230,7 +171,6 @@ esac
 		ScratchFS:                &task.ScratchFS{BaseURL: "file://" + scratchDir},
 		SignedURL:                "file://" + scratchDir + "/signed/outputs",
 		ServingURL:               "file://" + filepath.ToSlash(servingDir),
-		CreateBuildlet:           fakeBuildlets.CreateBuildlet,
 		SignService:              task.NewFakeSignService(t, scratchDir+"/signed/outputs"),
 		DownloadURL:              dlServer.URL,
 		ProxyPrefix:              dlServer.URL,
@@ -238,7 +178,7 @@ esac
 		GoogleDockerBuildProject: dockerProject,
 		GoogleDockerBuildTrigger: dockerTrigger,
 		BuildBucketClient:        buildBucket,
-		CloudBuildClient:         task.NewFakeCloudBuild(t, fakeGerrit, dockerProject, map[string]map[string]string{dockerTrigger: {"_GO_VERSION": wantVersion[2:]}}, ""),
+		CloudBuildClient:         task.NewFakeCloudBuild(t, fakeGerrit, dockerProject, map[string]map[string]string{dockerTrigger: {"_GO_VERSION": wantVersion[2:]}}),
 		SwarmingClient:           task.NewFakeSwarmingClient(t, fakeGo),
 		ApproveAction: func(ctx *workflow.TaskContext) error {
 			if strings.Contains(ctx.TaskName, "Release Coordinator Approval") {
@@ -253,7 +193,6 @@ esac
 	return &releaseTestDeps{
 		ctx:            ctx,
 		cancel:         cancel,
-		buildlets:      fakeBuildlets,
 		buildBucket:    buildBucket,
 		goRepo:         goRepo,
 		gerrit:         gerrit,
@@ -266,7 +205,7 @@ esac
 
 func testRelease(t *testing.T, prevTag string, major int, wantVersion string, kind task.ReleaseKind) {
 	deps := newReleaseTestDeps(t, prevTag, major, wantVersion)
-	wd := workflow.New()
+	wd := workflow.New(workflow.ACL{})
 
 	deps.gerrit.wantReviewers = []string{"heschi", "dmitshur"}
 	v := addSingleReleaseWorkflow(deps.buildTasks, deps.milestoneTasks, deps.versionTasks, wd, major, kind, workflow.Const(deps.gerrit.wantReviewers))
@@ -377,6 +316,14 @@ func testRelease(t *testing.T, prevTag string, major int, wantVersion string, ki
 		"go/VERSION":                        versionFile,
 		"go/tool/something_orother/compile": "",
 	})
+	checkTGZ(t, dlURL, files, "netbsd-arm.tar.gz", task.WebsiteFile{
+		OS:   "netbsd",
+		Arch: "arm" + map[int]string{21: "v6l", 22: "v6l"}[major],
+		Kind: "archive",
+	}, map[string]string{
+		"go/VERSION":                        versionFile,
+		"go/tool/something_orother/compile": "",
+	})
 	checkTGZ(t, dlURL, files, "darwin-amd64.tar.gz", task.WebsiteFile{
 		OS:   "darwin",
 		Arch: "amd64",
@@ -449,7 +396,7 @@ func testSecurity(t *testing.T, mergeFixes bool) {
 	}
 
 	// Run the release.
-	wd := workflow.New()
+	wd := workflow.New(workflow.ACL{})
 	v := addSingleReleaseWorkflow(deps.buildTasks, deps.milestoneTasks, deps.versionTasks, wd, 18, task.KindRC, workflow.Slice[string]())
 	workflow.Output(wd, "Published Go version", v)
 
@@ -493,7 +440,7 @@ func TestAdvisoryTestsFail(t *testing.T) {
 	}
 
 	// Run the release.
-	wd := workflow.New()
+	wd := workflow.New(workflow.ACL{})
 	v := addSingleReleaseWorkflow(deps.buildTasks, deps.milestoneTasks, deps.versionTasks, wd, 18, task.KindRC, workflow.Slice[string]())
 	workflow.Output(wd, "Published Go version", v)
 
@@ -507,8 +454,8 @@ func TestAdvisoryTestsFail(t *testing.T) {
 	if _, err := w.Run(deps.ctx, &verboseListener{t: t}); err != nil {
 		t.Fatal(err)
 	}
-	if testApprovals.Load() != 2 {
-		t.Errorf("advisory trybots didn't need approval")
+	if testApprovals.Load() != 1 {
+		t.Errorf("failed advisory builder didn't need approval")
 	}
 }
 
@@ -739,28 +686,6 @@ func (g *reviewerCheckGerrit) CreateAutoSubmitChange(ctx *workflow.TaskContext, 
 	return g.FakeGerrit.CreateAutoSubmitChange(ctx, input, reviewers, contents)
 }
 
-type fakeGitHub struct{}
-
-func (fakeGitHub) FetchMilestone(_ context.Context, owner, repo, name string, create bool) (int, error) {
-	return 0, nil
-}
-
-func (fakeGitHub) FetchMilestoneIssues(_ context.Context, owner, repo string, milestoneID int) (map[int]map[string]bool, error) {
-	return nil, nil
-}
-
-func (fakeGitHub) EditIssue(_ context.Context, owner string, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
-	return nil, nil, nil
-}
-
-func (fakeGitHub) EditMilestone(_ context.Context, owner string, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error) {
-	return nil, nil, nil
-}
-
-func (fakeGitHub) PostComment(_ context.Context, _ githubv4.ID, _ string) error {
-	return fmt.Errorf("pretend that PostComment failed")
-}
-
 type verboseListener struct {
 	t       *testing.T
 	onStall func()
@@ -796,10 +721,6 @@ type testLogger struct {
 }
 
 func (l *testLogger) Printf(format string, v ...interface{}) {
-	if l.task == "linux-amd64: Run long tests" && fmt.Sprintf(format, v...) == "Creating buildlet linux-amd64-bullseye." {
-		// TODO: This is very brittle; replace with a better way to test this property hasn't regressed.
-		l.t.Errorf("task %q logged creation of a non-longtest buildlet", l.task)
-	}
 	l.t.Logf("task %-10v: LOG: %s", l.task, fmt.Sprintf(format, v...))
 }
 

@@ -35,8 +35,8 @@
 // definition rather than producing an output. Unlike Actions and Tasks, they
 // execute multiple times and must produce exactly the same workflow
 // modifications each time. As such, they should be pure functions of their
-// inputs. Producing different modifications, or running multiple expansions
-// concurrently, is an error that will corrupt the workflow's state.
+// inputs. Producing different modifications is an error that will corrupt
+// the workflow's state. A workflow will run at most one expansion at a time.
 //
 // Once a Definition is complete, call Start to set its parameters and
 // instantiate it into a Workflow. Call Run to execute the workflow until
@@ -54,12 +54,19 @@ import (
 	"github.com/google/uuid"
 )
 
+type ACL struct {
+	// In order to interact with a workflow, the user must be a member
+	// of one of any of the following groups.
+	Groups []string
+}
+
 // New creates a new workflow definition.
-func New() *Definition {
+func New(acl ACL) *Definition {
 	return &Definition{
 		definitionState: &definitionState{
 			tasks:   make(map[string]*taskDefinition),
 			outputs: make(map[string]metaValue),
+			acl:     acl,
 		},
 	}
 }
@@ -82,7 +89,7 @@ func (d *Definition) name(name string) string {
 }
 
 func (d *Definition) shallowClone() *Definition {
-	clone := New()
+	clone := New(d.acl)
 	clone.namePrefix = d.namePrefix
 	clone.parameters = append([]MetaParameter(nil), d.parameters...)
 	for k, v := range d.tasks {
@@ -94,10 +101,20 @@ func (d *Definition) shallowClone() *Definition {
 	return clone
 }
 
+// AuthorizedGroups returns the list of groups which are authorized to create,
+// approve, stop, and retry this workflow. If any user can preform these
+// actions, a nil slice is returned.
+func (d *Definition) AuthorizedGroups() []string {
+	return d.acl.Groups
+}
+
 type definitionState struct {
 	parameters []MetaParameter // Ordered according to registration, unique parameter names.
 	tasks      map[string]*taskDefinition
 	outputs    map[string]metaValue
+	// list of groups that are allowed to interact with the associated
+	// definition.
+	acl ACL
 }
 
 // A TaskOption affects the execution of a task but is not an argument to its function.
@@ -215,6 +232,9 @@ var (
 	URL = ParamType[string]{
 		HTMLElement:   "input",
 		HTMLInputType: "url",
+	}
+	LongString = ParamType[string]{
+		HTMLElement: "textarea",
 	}
 
 	// Slice of string parameter types.
@@ -402,6 +422,9 @@ func addAction(d *Definition, name string, f interface{}, inputs []metaValue, op
 func addExpansion[O1 any](d *Definition, name string, f interface{}, inputs []metaValue, opts []TaskOption) *expansionResult[O1] {
 	td := addFunc(d, name, f, inputs, opts)
 	td.isExpansion = true
+	// Also record the workflow name prefix at the time the expansion is added.
+	// It'll be accessed later, when starting to run this expansion.
+	td.namePrefix = d.namePrefix
 	return &expansionResult[O1]{td}
 }
 
@@ -466,8 +489,7 @@ func (d *dependency) ready(w *Workflow) bool {
 // Unlike normal tasks, expansions may run multiple times and must produce
 // the exact same changes to the definition each time.
 //
-// Running more than one expansion concurrently is an error and will corrupt
-// the workflow.
+// A workflow will run at most one expansion at a time.
 func Expand0[O1 any](d *Definition, name string, f func(*Definition) (Value[O1], error), opts ...TaskOption) Value[O1] {
 	return addExpansion[O1](d, name, f, nil, opts)
 }
@@ -581,6 +603,7 @@ type Logger interface {
 type taskDefinition struct {
 	name        string
 	isExpansion bool
+	namePrefix  string // Workflow name prefix; applies only when isExpansion is true.
 	args        []metaValue
 	deps        []Dependency
 	f           interface{}
@@ -787,6 +810,7 @@ func (w *Workflow) Run(ctx context.Context, listener Listener) (map[string]inter
 	doneOnce := ctx.Done()
 	for {
 		running := 0
+		runningExpansion := false // Whether an expansion is running, and hasn't completed yet.
 		allDone := true
 		for _, task := range w.tasks {
 			if !task.created {
@@ -814,12 +838,18 @@ func (w *Workflow) Run(ctx context.Context, listener Listener) (map[string]inter
 				if !ready {
 					continue
 				}
+				if task.def.isExpansion && runningExpansion {
+					// Don't start a new expansion until the currently running one completes.
+					continue
+				}
 				task.started = true
 				running++
 				listener.TaskStateChanged(w.ID, task.def.name, task.toExported())
 				taskCopy := *task
 				if task.def.isExpansion {
+					runningExpansion = true
 					defCopy := w.def.shallowClone()
+					defCopy.namePrefix = task.def.namePrefix
 					go func() { stateChan <- runExpansion(defCopy, taskCopy, args) }()
 				} else {
 					go func() { stateChan <- runTask(ctx, w.ID, listener, taskCopy, args) }()
@@ -841,6 +871,7 @@ func (w *Workflow) Run(ctx context.Context, listener Listener) (map[string]inter
 		case state := <-stateChan:
 			if state.def.isExpansion && state.finished && state.err == nil {
 				state.err = w.expand(state.expanded)
+				runningExpansion = false
 			}
 			listener.TaskStateChanged(w.ID, state.def.name, state.toExported())
 			w.tasks[state.def] = &state

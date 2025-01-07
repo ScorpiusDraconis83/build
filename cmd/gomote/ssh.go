@@ -25,7 +25,7 @@ func ssh(args []string) error {
 
 	fs := flag.NewFlagSet("ssh", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "ssh usage: gomote ssh <instance>")
+		usageLogger.Print("ssh usage: gomote ssh <instance>")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -119,9 +119,9 @@ func sshConnect(name string, priKey, certPath string) error {
 	if err != nil {
 		return fmt.Errorf("path to ssh not found: %w", err)
 	}
-	sshServer := "farmer.golang.org"
-	if luciEnabled() {
-		sshServer = "gomotessh.golang.org"
+	sshServer := "gomotessh.golang.org"
+	if luciDisabled() {
+		sshServer = "farmer.golang.org"
 	}
 	cli := []string{"-o", fmt.Sprintf("CertificateFile=%s", certPath), "-i", priKey, "-p", "2222", name + "@" + sshServer}
 	fmt.Printf("$ %s %s\n", ssh, strings.Join(cli, " "))

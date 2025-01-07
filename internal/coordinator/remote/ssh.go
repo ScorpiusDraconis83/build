@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.16 && (linux || darwin)
+//go:build linux || darwin
 
 package remote
 
@@ -434,27 +434,10 @@ func (ss *SSHServer) HandleIncomingSSHPostAuthSwarming(s gssh.Session) {
 			setWinsize(f, win.Width, win.Height)
 		}
 	}()
-	go func() {
-		ss.setupRemoteSSHEnvSwarm(rs.BuilderType, workDir, f)
-		io.Copy(f, s) // stdin
-	}()
-	io.Copy(s, f) // stdout
+	go io.Copy(f, s) // stdin
+	io.Copy(s, f)    // stdout
 	cmd.Process.Kill()
 	cmd.Wait()
-}
-
-// setupRemoteSSHEnvSwarm prints environmental details to the writer.
-// This makes the new SSH session easier to use for Go testing.
-func (ss *SSHServer) setupRemoteSSHEnvSwarm(builderType, workDir string, f io.Writer) {
-	if strings.Contains(builderType, "windows") {
-		fmt.Fprintf(f, `set GOPATH=%s\gopath`+"\n", workDir)
-		fmt.Fprintf(f, `set PATH=%%PATH%%;%s\go\bin`+"\n", workDir)
-		fmt.Fprintf(f, `cd %s\go\src`+"\n", workDir)
-		return
-	}
-	fmt.Fprintf(f, "GOPATH=%s/gopath\n", workDir)
-	fmt.Fprintf(f, "PATH=$PATH:%s/go/bin\n", workDir)
-	fmt.Fprintf(f, "export GOPATH PATH\n")
 }
 
 // setupRemoteSSHEnv sets up environment variables on the remote system.

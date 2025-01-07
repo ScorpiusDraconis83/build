@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
+	pathpkg "path"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -19,7 +20,9 @@ import (
 
 	buildbucketpb "go.chromium.org/luci/buildbucket/proto"
 	"golang.org/x/build/gerrit"
+	"golang.org/x/build/internal/gitfs"
 	"golang.org/x/build/internal/releasetargets"
+	"golang.org/x/build/internal/relui/groups"
 	wf "golang.org/x/build/internal/workflow"
 	"golang.org/x/exp/slices"
 	"golang.org/x/mod/modfile"
@@ -34,7 +37,7 @@ type TagXReposTasks struct {
 }
 
 func (x *TagXReposTasks) NewDefinition() *wf.Definition {
-	wd := wf.New()
+	wd := wf.New(wf.ACL{Groups: []string{groups.ReleaseTeam}})
 	reviewers := wf.Param(wd, reviewersParam)
 	repos := wf.Task0(wd, "Select repositories", x.SelectRepos)
 	done := wf.Expand2(wd, "Create plan", x.BuildPlan, repos, reviewers)
@@ -43,7 +46,7 @@ func (x *TagXReposTasks) NewDefinition() *wf.Definition {
 }
 
 func (x *TagXReposTasks) NewSingleDefinition() *wf.Definition {
-	wd := wf.New()
+	wd := wf.New(wf.ACL{Groups: []string{groups.ReleaseTeam}})
 	reviewers := wf.Param(wd, reviewersParam)
 	repos := wf.Task0(wd, "Load all repositories", x.SelectRepos)
 	name := wf.Param(wd, wf.ParamDef[string]{Name: "Repository name", Example: "tools"})
@@ -56,7 +59,7 @@ func (x *TagXReposTasks) NewSingleDefinition() *wf.Definition {
 }
 
 var reviewersParam = wf.ParamDef[[]string]{
-	Name:      "Reviewer usernames (optional)",
+	Name:      "Reviewer Gerrit Usernames (optional)",
 	ParamType: wf.SliceShort,
 	Doc:       `Send code reviews to these users.`,
 	Example:   "heschi",
@@ -68,7 +71,6 @@ type TagRepo struct {
 	Name         string    // Gerrit project name, e.g., "tools".
 	ModPath      string    // Module path, e.g., "golang.org/x/tools".
 	Deps         []*TagDep // Dependency modules.
-	Compat       string    // The Go version to pass to go mod tidy -compat for this repository.
 	StartVersion string    // The version of the module when the workflow started. Empty string means repo hasn't begun release version tagging yet.
 	NewerVersion string    // The version of the module that will be tagged, or the empty string when the repo is being updated only and not tagged.
 }
@@ -192,14 +194,6 @@ func (x *TagXReposTasks) readRepo(ctx *wf.TaskContext, project string) (*TagRepo
 		StartVersion: currentTag,
 	}
 
-	compatRe := regexp.MustCompile(`tagx:compat\s+([\d.]+)`)
-	if mf.Go != nil {
-		for _, c := range mf.Go.Syntax.Comments.Suffix {
-			if matches := compatRe.FindStringSubmatch(c.Token); matches != nil {
-				result.Compat = matches[1]
-			}
-		}
-	}
 	for _, req := range mf.Require {
 		if !isXRoot(req.Mod.Path) {
 			continue
@@ -222,6 +216,7 @@ func (x *TagXReposTasks) readRepo(ctx *wf.TaskContext, project string) (*TagRepo
 			Wait:    wait,
 		})
 	}
+
 	return result, nil
 }
 
@@ -390,32 +385,67 @@ func (x *TagXReposTasks) UpdateGoMod(ctx *wf.TaskContext, repo TagRepo, deps []T
 	}
 	script.WriteString("\n")
 
-	// Tidy the root module.
-	// Also tidy nested modules with a replace directive.
-	dirs := []string{"."}
-	switch repo.Name {
-	case "exp":
-		dirs = append(dirs, "slog/benchmarks/zap_benchmarks")     // A local replace directive as of 2023-09-05.
-		dirs = append(dirs, "slog/benchmarks/zerolog_benchmarks") // A local replace directive as of 2023-09-05.
-	case "telemetry":
-		dirs = append(dirs, "godev") // A local replace directive as of 2023-09-05.
-	case "tools":
-		dirs = append(dirs, "gopls") // A local replace directive as of 2023-09-05.
+	// Tidy the root module and nested modules.
+	// Look for the nested modules dynamically. See go.dev/issue/68873.
+	gitRepo, err := gitfs.NewRepo(x.Gerrit.GitilesURL() + "/" + repo.Name)
+	if err != nil {
+		return nil, err
+	}
+	head, err := gitRepo.Resolve("refs/heads/" + branch)
+	if err != nil {
+		return nil, err
+	}
+	ctx.Printf("Using commit %q as the branch %q head.", head, branch)
+	rootFS, err := gitRepo.CloneHash(head)
+	if err != nil {
+		return nil, err
 	}
 	var outputs []string
-	for _, dir := range dirs {
-		compat := ""
-		if repo.Compat != "" {
-			compat = "-compat " + repo.Compat
+	if err := fs.WalkDir(rootFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		script.WriteString(fmt.Sprintf("(cd %v && touch go.sum && go mod tidy %v)\n", dir, compat))
-		outputs = append(outputs, dir+"/go.mod", dir+"/go.sum")
+		if path != "." && d.IsDir() && (strings.HasPrefix(d.Name(), ".") || strings.HasPrefix(d.Name(), "_") || d.Name() == "testdata") {
+			// Skip directories that begin with ".", "_", or are named "testdata".
+			return fs.SkipDir
+		}
+		if d.Name() == "go.mod" && !d.IsDir() { // A go.mod file.
+			dir := pathpkg.Dir(path)
+			dropToolchain := ""
+			if had, err := hasToolchain(rootFS, path); err != nil {
+				return err
+			} else if !had {
+				// Don't introduce a toolchain directive if it wasn't already there.
+				dropToolchain = " && go mod edit -toolchain=none"
+			}
+			script.WriteString(fmt.Sprintf("(cd %v && touch go.sum && go mod tidy%s)\n", dir, dropToolchain))
+			outputs = append(outputs, dir+"/go.mod", dir+"/go.sum")
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
+	// Execute the script to generate updated go.mod/go.sum files.
 	build, err := x.CloudBuild.RunScript(ctx, script.String(), repo.Name, outputs)
 	if err != nil {
 		return nil, err
 	}
 	return buildToOutputs(ctx, x.CloudBuild, build)
+}
+
+// hasToolchain parses the specified go.mod file, and
+// reports whether it has a toolchain directive in it.
+func hasToolchain(fsys fs.FS, goModPath string) (has bool, _ error) {
+	b, err := fs.ReadFile(fsys, goModPath)
+	if err != nil {
+		return false, err
+	}
+	f, err := modfile.Parse(goModPath, b, nil)
+	if err != nil {
+		return false, err
+	}
+	return f.Toolchain != nil, nil
 }
 
 func buildToOutputs(ctx *wf.TaskContext, buildClient CloudBuildClient, build CloudBuild) (map[string]string, error) {
@@ -490,30 +520,49 @@ func (x *TagXReposTasks) findMissingBuilders(ctx *wf.TaskContext, repo TagRepo, 
 		return nil, err
 	}
 
-	type port struct {
-		GOOS   string `json:"goos"`
-		GOARCH string `json:"goarch"`
-	}
-	type projectProp struct {
-		Project  string `json:"project"`
-		IsGoogle bool   `json:"is_google"`
-		Target   port   `json:"target"`
-	}
-
-	wantBuilders := map[string]bool{}
-	for id, b := range builders {
-		props := &projectProp{}
+	var wantBuilders = make(map[string]bool)
+	for name, b := range builders {
+		type port struct {
+			GOOS   string `json:"goos"`
+			GOARCH string `json:"goarch"`
+		}
+		var props struct {
+			BuilderMode int    `json:"mode"`
+			Project     string `json:"project"`
+			IsGoogle    bool   `json:"is_google"`
+			KnownIssue  int    `json:"known_issue"`
+			Target      port   `json:"target"`
+		}
 		if err := json.Unmarshal([]byte(b.Properties), &props); err != nil {
-			return nil, fmt.Errorf("error unmarshaling properties for %v: %v", id, err)
+			return nil, fmt.Errorf("error unmarshaling properties for %v: %v", name, err)
 		}
-		if props.Project == repo.Name && props.IsGoogle && releasetargets.IsFirstClass(props.Target.GOOS, props.Target.GOARCH) {
-			wantBuilders[id] = true
+		if props.Project != repo.Name || !props.IsGoogle || !releasetargets.IsFirstClass(props.Target.GOOS, props.Target.GOARCH) {
+			continue
 		}
+		var skip []string // Log-worthy causes of skip, if any.
+		// golangbuildModePerf is golangbuild's MODE_PERF mode that
+		// runs benchmarks. It's the first custom mode not relevant
+		// to building and testing, and the expectation is that any
+		// modes after it will be fine to skip for release purposes.
+		//
+		// See https://source.chromium.org/chromium/infra/infra/+/main:go/src/infra/experimental/golangbuild/golangbuildpb/params.proto;l=174-177;drc=fdea4abccf8447808d4e702c8d09fdd20fd81acb.
+		const golangbuildModePerf = 4
+		if props.BuilderMode >= golangbuildModePerf {
+			skip = append(skip, fmt.Sprintf("custom mode %d", props.BuilderMode))
+		}
+		if props.KnownIssue != 0 {
+			skip = append(skip, fmt.Sprintf("known issue %d", props.KnownIssue))
+		}
+		if len(skip) != 0 {
+			ctx.Printf("skipping %s because of %s", name, strings.Join(skip, ", "))
+			continue
+		}
+		wantBuilders[name] = true
 	}
 
-	for id := range wantBuilders {
+	for name := range wantBuilders {
 		pred := &buildbucketpb.BuildPredicate{
-			Builder: &buildbucketpb.BuilderID{Project: "golang", Bucket: "ci", Builder: id},
+			Builder: &buildbucketpb.BuilderID{Project: "golang", Bucket: "ci", Builder: name},
 			Tags: []*buildbucketpb.StringPair{
 				{Key: "buildset", Value: fmt.Sprintf("commit/gitiles/%s/%s/+/%s", hostFromURL(x.Gerrit.GitilesURL()), repo.Name, head)},
 			},
@@ -524,10 +573,10 @@ func (x *TagXReposTasks) findMissingBuilders(ctx *wf.TaskContext, repo TagRepo, 
 			return nil, err
 		}
 		if len(succesfulBuilds) != 0 {
-			ctx.Printf("%v: found successful builds: %v", id, succesfulBuilds)
-			delete(wantBuilders, id)
+			ctx.Printf("%v: found successful builds: %v", name, succesfulBuilds)
+			delete(wantBuilders, name)
 		} else {
-			ctx.Printf("%v: no successful builds", id)
+			ctx.Printf("%v: no successful builds", name)
 		}
 	}
 	return wantBuilders, nil

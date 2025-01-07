@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -35,6 +36,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// expDisableGolangbuild disables the use of golangbuild during the swarming task gomote bootstrap process.
+const expDisableGolangbuild = "disable-golang-build"
 
 type rendezvousClient interface {
 	DeregisterInstance(ctx context.Context, id string)
@@ -186,8 +190,9 @@ func (ss *SwarmingServer) CreateInstance(req *protos.CreateInstanceRequest, stre
 		log.Printf("CreateInstance: builder configuration not found for %s: %s", builder.GetId().GetBuilder(), err)
 		return status.Errorf(codes.Internal, "invalid builder configuration")
 	}
+	useGolangbuild := !slices.Contains(req.GetExperimentOption(), expDisableGolangbuild)
 	go func() {
-		bc, err := ss.startNewSwarmingTask(stream.Context(), name, dimensions, cp, &SwarmOpts{})
+		bc, err := ss.startNewSwarmingTask(stream.Context(), name, dimensions, cp, &SwarmOpts{}, useGolangbuild)
 		if err != nil {
 			log.Printf("startNewSwarmingTask() = %s", err)
 		}
@@ -292,9 +297,10 @@ func (ss *SwarmingServer) ExecuteCommand(req *protos.ExecuteCommandRequest, stre
 			}
 			return len(p), nil
 		}},
-		Args:  req.GetArgs(),
-		Debug: req.GetDebug(),
-		Path:  req.GetPath(),
+		Args:     req.GetArgs(),
+		ExtraEnv: req.GetAppendEnvironment(),
+		Debug:    req.GetDebug(),
+		Path:     req.GetPath(),
 	})
 	if execErr != nil {
 		// there were system errors preventing the command from being started or seen to completion.
@@ -330,6 +336,35 @@ func (ss *SwarmingServer) InstanceAlive(ctx context.Context, req *protos.Instanc
 
 // ListDirectory lists the contents of the directory on a gomote instance.
 func (ss *SwarmingServer) ListDirectory(ctx context.Context, req *protos.ListDirectoryRequest) (*protos.ListDirectoryResponse, error) {
+	entries, err := ss.listDirectory(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &protos.ListDirectoryResponse{
+		Entries: entries,
+	}, nil
+}
+
+// ListDirectoryStreaming lists the contents of the directory on a gomote instance.
+func (ss *SwarmingServer) ListDirectoryStreaming(req *protos.ListDirectoryRequest, stream grpc.ServerStreamingServer[protos.ListDirectoryResponse]) error {
+	entries, err := ss.listDirectory(stream.Context(), req)
+	if err != nil {
+		return err
+	}
+	// This could use slices.Chunk, once our go.mod is on go1.23 or higher.
+	const chunkSize = 100
+	for i := 0; i < len(entries); i += chunkSize {
+		end := min(chunkSize, len(entries[i:]))
+		if err := stream.Send(&protos.ListDirectoryResponse{
+			Entries: entries[i : i+end],
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ss *SwarmingServer) listDirectory(ctx context.Context, req *protos.ListDirectoryRequest) ([]string, error) {
 	creds, err := access.IAPFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "request does not contain the required authentication")
@@ -353,16 +388,21 @@ func (ss *SwarmingServer) ListDirectory(ctx context.Context, req *protos.ListDir
 	}); err != nil {
 		return nil, status.Errorf(codes.Unimplemented, "method ListDirectory not implemented")
 	}
-	return &protos.ListDirectoryResponse{
-		Entries: entries,
-	}, nil
+	return entries, nil
 }
 
-// golangbuildModeAll is golangbuild's MODE_ALL mode that
-// builds and tests the project all within the same build.
-//
-// See https://source.chromium.org/chromium/infra/infra/+/main:go/src/infra/experimental/golangbuild/golangbuildpb/params.proto;l=148-149;drc=4e874bfb4ff7ff0620940712983ca82e8ea81028.
-const golangbuildModeAll = 0
+const (
+	// golangbuildModeAll is golangbuild's MODE_ALL mode that
+	// builds and tests the project all within the same build.
+	//
+	// See https://source.chromium.org/chromium/infra/infra/+/main:go/src/infra/experimental/golangbuild/golangbuildpb/params.proto;l=148-149;drc=4e874bfb4ff7ff0620940712983ca82e8ea81028.
+	golangbuildModeAll = 0
+	// golangbuildPerfMode is golangbuild's MODE_PERF that
+	// runs performance tests.
+	//
+	// See https://source.chromium.org/chromium/infra/infra/+/main:go/src/infra/experimental/golangbuild/golangbuildpb/params.proto;l=174-177;drc=fdea4abccf8447808d4e702c8d09fdd20fd81acb.
+	golangbuildPerfMode = 4
+)
 
 func (ss *SwarmingServer) validBuilders(ctx context.Context) (map[string]*buildbucketpb.BuilderItem, error) {
 	listBuilders := func(bucket string) ([]*buildbucketpb.BuilderItem, error) {
@@ -400,9 +440,6 @@ func (ss *SwarmingServer) validBuilders(ctx context.Context) (map[string]*buildb
 			continue
 		}
 		name := bID.GetBuilder()
-		if !strings.HasPrefix(name, "go") {
-			continue
-		}
 		if !strings.HasSuffix(name, "-test_only") {
 			continue
 		}
@@ -421,15 +458,12 @@ func (ss *SwarmingServer) validBuilders(ctx context.Context) (map[string]*buildb
 			continue
 		}
 		name := bID.GetBuilder()
-		if !strings.HasPrefix(name, "go") {
-			continue
-		}
 		if _, ok := builders[name]; ok {
 			// should not happen
 			continue
 		}
 		config, err := builderProperties(builder)
-		if err != nil || config.Mode != golangbuildModeAll {
+		if err != nil || !slices.Contains([]int{golangbuildModeAll, golangbuildPerfMode}, config.Mode) {
 			continue
 		}
 		builders[name] = builder
@@ -449,7 +483,7 @@ func (ss *SwarmingServer) ListSwarmingBuilders(ctx context.Context, req *protos.
 		return nil, err
 	}
 	var builders []string
-	for builder, _ := range bs {
+	for builder := range bs {
 		builders = append(builders, builder)
 	}
 	sort.Strings(builders)
@@ -751,11 +785,11 @@ type SwarmOpts struct {
 // running on it. It returns a buildlet client configured to speak to it.
 // The request will last as long as the lifetime of the context. The dimensions
 // are a set of key value pairs used to describe what instance type to create.
-func (ss *SwarmingServer) startNewSwarmingTask(ctx context.Context, name string, dimensions map[string]string, properties *configProperties, opts *SwarmOpts) (buildlet.Client, error) {
+func (ss *SwarmingServer) startNewSwarmingTask(ctx context.Context, name string, dimensions map[string]string, properties *configProperties, opts *SwarmOpts, useGolangbuild bool) (buildlet.Client, error) {
 	ss.rendezvous.RegisterInstance(ctx, name, 10*time.Minute)
 	condRun(opts.OnInstanceRegistration)
 
-	taskID, err := ss.newSwarmingTask(ctx, name, dimensions, properties, opts)
+	taskID, err := ss.newSwarmingTask(ctx, name, dimensions, properties, opts, useGolangbuild)
 	if err != nil {
 		ss.rendezvous.DeregisterInstance(ctx, name)
 		return nil, err
@@ -803,7 +837,7 @@ func (ss *SwarmingServer) startNewSwarmingTask(ctx context.Context, name string,
 // waitForInstanceOrFailure waits for either the swarming task to enter a failed state or the successful connection from
 // a buildlet client.
 func (ss *SwarmingServer) waitForInstanceOrFailure(ctx context.Context, taskID, name string) (buildlet.Client, error) {
-	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	queryCtx, cancel := context.WithTimeout(ctx, 25*time.Minute)
 
 	checkForTaskFailure := func(pollCtx context.Context) <-chan error {
 		errCh := make(chan error, 1)
@@ -922,10 +956,17 @@ func platformToGoValues(platform string) (goos string, goarch string, err error)
 	if goos == "Mac" || goos == "mac" {
 		goos = "darwin"
 	}
+	if goarch == "armv6l" {
+		goarch = "arm"
+	}
 	return goos, goarch, nil
 }
 
-func (ss *SwarmingServer) newSwarmingTask(ctx context.Context, name string, dimensions map[string]string, properties *configProperties, opts *SwarmOpts) (string, error) {
+func (ss *SwarmingServer) newSwarmingTask(ctx context.Context, name string, dimensions map[string]string, properties *configProperties, opts *SwarmOpts, useGolangbuild bool) (string, error) {
+	if useGolangbuild {
+
+		return ss.newSwarmingTaskWithGolangbuild(ctx, name, dimensions, properties, opts)
+	}
 	cipdPlatform, ok := dimensions["cipd_platform"]
 	if !ok {
 		return "", fmt.Errorf("dimensions require cipd_platform: instance=%s", name)
@@ -936,7 +977,7 @@ func (ss *SwarmingServer) newSwarmingTask(ctx context.Context, name string, dime
 	}
 	packages := []*swarmpb.CipdPackage{
 		{Path: "tools/bin", PackageName: "infra/tools/luci-auth/" + cipdPlatform, Version: "latest"},
-		{Path: "tools", PackageName: "golang/bootstrap-go/" + cipdPlatform, Version: properties.BootstrapVersion},
+		{Path: "tools/bootstrap-go", PackageName: "golang/bootstrap-go/" + cipdPlatform, Version: properties.BootstrapVersion},
 	}
 	pythonBin := "python3"
 	switch goos {
@@ -949,12 +990,116 @@ func (ss *SwarmingServer) newSwarmingTask(ctx context.Context, name string, dime
 		pythonBin = `tools\bin\python3.exe`
 		packages = append(packages, &swarmpb.CipdPackage{Path: "tools", PackageName: "infra/3pp/tools/cpython3/" + cipdPlatform, Version: "latest"})
 	}
+
 	req := &swarmpb.NewTaskRequest{
 		Name:           name,
 		Priority:       20, // 30 is the priority for builds
 		ServiceAccount: "coordinator-builder@golang-ci-luci.iam.gserviceaccount.com",
 		TaskSlices: []*swarmpb.TaskSlice{
-			&swarmpb.TaskSlice{
+			{
+				Properties: &swarmpb.TaskProperties{
+					CipdInput: &swarmpb.CipdInput{
+						Packages: packages,
+					},
+					EnvPrefixes: []*swarmpb.StringListPair{
+						{Key: "PATH", Value: []string{"tools/bin", "go/bin"}},
+						{Key: "GOROOT_BOOTSTRAP", Value: []string{"tools/bootstrap-go"}},
+						{Key: "GOPATH", Value: []string{"gopath"}},
+					},
+					Command:    []string{pythonBin, "-c", buildletStartup(goos, goarch)},
+					Dimensions: createStringPairs(dimensions),
+					Env: []*swarmpb.StringPair{
+						{
+							Key:   "GOMOTEID",
+							Value: name,
+						},
+					},
+					// The swarming limits state it must be between 30s and 601140s. This information is returned
+					// as part of an error message when you attempt a request with a value outside of these boundaries.
+					ExecutionTimeoutSecs: 601140,
+				},
+				ExpirationSecs:  86400,
+				WaitForCapacity: false,
+			},
+		},
+		Tags:  []string{"golang_mode:gomote"},
+		Realm: "golang:ci",
+	}
+	taskMD, err := ss.swarmingClient.NewTask(ctx, req)
+	if err != nil {
+		log.Printf("gomote: swarming task creation failed name=%s: %s", name, err)
+		return "", fmt.Errorf("unable to start task: %w", err)
+	}
+	log.Printf("gomote: task created: id=%s https://chromium-swarm.appspot.com/task?id=%s", taskMD.TaskId, taskMD.TaskId)
+	return taskMD.TaskId, nil
+}
+
+func golangbuildStartup(goos, goarch, golangbuildBin string) string {
+	cmd := `import urllib.request
+import sys
+import platform
+import subprocess
+import os
+import stat
+
+def make_executable(file_path):
+    if sys.platform != "win32":
+        st = os.stat(file_path)
+        os.chmod(file_path, st.st_mode | stat.S_IEXEC)
+
+if __name__ == "__main__":
+    ext = ""
+    if sys.platform == "win32":
+        ext = ".exe"
+    sep = "/"
+    if sys.platform == "win32":
+        sep = "\\\\"
+    buildlet_file = "buildlet" + ext
+    buildlet_path = "." + sep + buildlet_file
+    if os.path.exists(buildlet_path):
+        os.remove(buildlet_path)
+    urllib.request.urlretrieve("https://storage.googleapis.com/go-builder-data/buildlet.%s-%s", buildlet_path)
+    make_executable(os.getcwd() + sep + buildlet_file)
+    subprocess.run(["%s", buildlet_path, "--workdir="+os.getcwd(), "--coordinator=gomotessh.golang.org:443", "--reverse-type=swarming-task", "-swarming-bot", "-halt=false"], shell=False, env=os.environ.copy())
+`
+	return fmt.Sprintf(cmd, goos, goarch, golangbuildBin)
+}
+
+func (ss *SwarmingServer) newSwarmingTaskWithGolangbuild(ctx context.Context, name string, dimensions map[string]string, properties *configProperties, opts *SwarmOpts) (string, error) {
+	log.Printf("gomote: swarming task creation using golangbuild name=%s", name)
+	cipdPlatform, ok := dimensions["cipd_platform"]
+	if !ok {
+		return "", fmt.Errorf("dimensions require cipd_platform: instance=%s", name)
+	}
+	goos, goarch, err := platformToGoValues(cipdPlatform)
+	if err != nil {
+		return "", err
+	}
+	packages := []*swarmpb.CipdPackage{
+		{Path: "tools/bin", PackageName: "infra/experimental/golangbuild/" + cipdPlatform, Version: "latest"},
+		{Path: "tools/bin", PackageName: "infra/tools/cipd/" + cipdPlatform, Version: "latest"},
+		{Path: "tools/bin", PackageName: "infra/tools/luci-auth/" + cipdPlatform, Version: "latest"},
+	}
+	pythonBin := "python3"
+	golangbuildBin := "golangbuild"
+	switch goos {
+	case "darwin":
+		golangbuildBin = `tools/bin/golangbuild`
+		pythonBin = `tools/bin/python3`
+		packages = append(packages,
+			&swarmpb.CipdPackage{Path: "tools", PackageName: "infra/3pp/tools/cpython3/" + cipdPlatform, Version: "latest"})
+	case "windows":
+		golangbuildBin = `tools\\bin\\golangbuild.exe`
+		pythonBin = `tools\bin\python3.exe`
+		packages = append(packages, &swarmpb.CipdPackage{Path: "tools", PackageName: "infra/3pp/tools/cpython3/" + cipdPlatform, Version: "latest"})
+	}
+
+	req := &swarmpb.NewTaskRequest{
+		Name:           name,
+		Priority:       20, // 30 is the priority for builds
+		ServiceAccount: "coordinator-builder@golang-ci-luci.iam.gserviceaccount.com",
+		TaskSlices: []*swarmpb.TaskSlice{
+			{
 				Properties: &swarmpb.TaskProperties{
 					CipdInput: &swarmpb.CipdInput{
 						Packages: packages,
@@ -962,15 +1107,21 @@ func (ss *SwarmingServer) newSwarmingTask(ctx context.Context, name string, dime
 					EnvPrefixes: []*swarmpb.StringListPair{
 						{Key: "PATH", Value: []string{"tools/bin"}},
 					},
-					Command:    []string{pythonBin, "-c", buildletStartup(goos, goarch)},
+					Command:    []string{pythonBin, "-c", golangbuildStartup(goos, goarch, golangbuildBin)},
 					Dimensions: createStringPairs(dimensions),
 					Env: []*swarmpb.StringPair{
-						&swarmpb.StringPair{
+						{
 							Key:   "GOMOTEID",
 							Value: name,
 						},
+						{
+							Key:   "GOMOTE_SETUP",
+							Value: properties.BuilderId,
+						},
 					},
-					ExecutionTimeoutSecs: 86400,
+					// The swarming limits state it must be between 30s and 601140s. This information is returned
+					// as part of an error message when you attempt a request with a value outside of these boundaries.
+					ExecutionTimeoutSecs: 601140,
 				},
 				ExpirationSecs:  86400,
 				WaitForCapacity: false,
@@ -1003,6 +1154,7 @@ func tryThenPeriodicallyDo(ctx context.Context, period time.Duration, f func(con
 type configProperties struct {
 	BootstrapVersion string `json:"bootstrap_version"`
 	Mode             int    `json:"mode"`
+	BuilderId        string // <project>/<bucket>/<builder>
 }
 
 func builderProperties(builder *buildbucketpb.BuilderItem) (*configProperties, error) {
@@ -1013,5 +1165,7 @@ func builderProperties(builder *buildbucketpb.BuilderItem) (*configProperties, e
 	if cp.BootstrapVersion == "" {
 		cp.BootstrapVersion = "latest"
 	}
+	id := builder.GetId()
+	cp.BuilderId = fmt.Sprintf("%s/%s/%s", id.GetProject(), id.GetBucket(), id.GetBuilder())
 	return cp, nil
 }

@@ -6,12 +6,15 @@ package task
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v48/github"
 	"github.com/shurcooL/githubv4"
 	wf "golang.org/x/build/internal/workflow"
 	goversion "golang.org/x/build/maintner/maintnerd/maintapi/version"
@@ -300,15 +303,36 @@ type GitHubClientInterface interface {
 	// and their labels.
 	FetchMilestoneIssues(ctx context.Context, owner, repo string, milestoneID int) (map[int]map[string]bool, error)
 
+	// See github.Client.Issues.Create.
+	CreateIssue(ctx context.Context, owner, repo string, issue *github.IssueRequest) (*github.Issue, *github.Response, error)
+
 	// See github.Client.Issues.Edit.
-	EditIssue(ctx context.Context, owner string, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error)
+	EditIssue(ctx context.Context, owner, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error)
+
+	// See github.Client.Issues.Get.
+	GetIssue(ctx context.Context, owner, repo string, number int) (*github.Issue, *github.Response, error)
 
 	// See github.Client.Issues.EditMilestone.
-	EditMilestone(ctx context.Context, owner string, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error)
+	EditMilestone(ctx context.Context, owner, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error)
 
 	// PostComment creates a comment on a GitHub issue or pull request
 	// identified by the given GitHub Node ID.
 	PostComment(_ context.Context, id githubv4.ID, body string) error
+
+	// See github.Client.Repositories.CreateRelease.
+	CreateRelease(ctx context.Context, owner, repo string, release *github.RepositoryRelease) (*github.RepositoryRelease, error)
+
+	// UploadReleaseAsset uploads an fs.File to a GitHub release as a release
+	// asset.
+	// It uses NewUploadRequest as github.Client.Repositories.UploadReleaseAsset
+	// only supports uploading from an os.File.
+	// Parameters:
+	//   - owner:     The account owner of the repository.
+	//   - repo:      The name of the repository.
+	//   - releaseID: The ID of the github release.
+	//   - fileName:  The name of the asset as it will appear in the release.
+	//   - file:      The content of the file to upload.
+	UploadReleaseAsset(ctx context.Context, owner, repo string, releaseID int64, fileName string, file fs.File) (*github.ReleaseAsset, error)
 }
 
 type GitHubClient struct {
@@ -333,6 +357,36 @@ func (c *GitHubClient) FetchMilestone(ctx context.Context, owner, repo, name str
 		return 0, fmt.Errorf("could not find an open milestone named %q and creating it failed: %v", name, createErr)
 	}
 	return *m.Number, nil
+}
+
+func (c *GitHubClient) UploadReleaseAsset(ctx context.Context, owner, repo string, releaseID int64, fileName string, file fs.File) (*github.ReleaseAsset, error) {
+	// Query parameter "name" is used to determine the asset name.
+	// See details https://docs.github.com/en/rest/releases/assets?apiVersion=2022-11-28#upload-a-release-asset
+	u := fmt.Sprintf("repos/%s/%s/releases/%d/assets?name=%s", owner, repo, releaseID, url.QueryEscape(fileName))
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if stat.IsDir() {
+		return nil, errors.New("the asset to upload can't be a directory")
+	}
+
+	req, err := c.V3.NewUploadRequest(u, file, stat.Size(), "")
+	if err != nil {
+		return nil, err
+	}
+
+	asset := new(github.ReleaseAsset)
+	if _, err = c.V3.Do(ctx, req, asset); err != nil {
+		return nil, err
+	}
+	return asset, nil
+}
+
+func (c *GitHubClient) CreateRelease(ctx context.Context, owner, repo string, release *github.RepositoryRelease) (*github.RepositoryRelease, error) {
+	release, _, err := c.V3.Repositories.CreateRelease(ctx, owner, repo, release)
+	return release, err
 }
 
 func findMilestone(ctx context.Context, client *githubv4.Client, owner, repo, name string) (int, bool, error) {
@@ -440,11 +494,19 @@ more:
 	return issues, nil
 }
 
-func (c *GitHubClient) EditIssue(ctx context.Context, owner string, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
+func (c *GitHubClient) EditIssue(ctx context.Context, owner, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
 	return c.V3.Issues.Edit(ctx, owner, repo, number, issue)
 }
 
-func (c *GitHubClient) EditMilestone(ctx context.Context, owner string, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error) {
+func (c *GitHubClient) CreateIssue(ctx context.Context, owner, repo string, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
+	return c.V3.Issues.Create(ctx, owner, repo, issue)
+}
+
+func (c *GitHubClient) GetIssue(ctx context.Context, owner, repo string, number int) (*github.Issue, *github.Response, error) {
+	return c.V3.Issues.Get(ctx, owner, repo, number)
+}
+
+func (c *GitHubClient) EditMilestone(ctx context.Context, owner, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error) {
 	return c.V3.Issues.EditMilestone(ctx, owner, repo, number, milestone)
 }
 

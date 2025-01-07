@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.16 && (linux || darwin)
+//go:build linux || darwin
 
 package main
 
@@ -32,6 +32,7 @@ import (
 	"golang.org/x/build/internal/coordinator/pool"
 	"golang.org/x/build/internal/coordinator/pool/queue"
 	"golang.org/x/build/internal/coordinator/schedule"
+	"golang.org/x/build/internal/migration"
 	"golang.org/x/build/internal/singleflight"
 	"golang.org/x/build/internal/sourcecache"
 	"golang.org/x/build/internal/spanlog"
@@ -598,19 +599,15 @@ func (st *buildStatus) SpanRecord(sp *schedule.Span, err error) *types.SpanRecor
 
 // goBuilder returns a GoBuilder for this buildStatus.
 func (st *buildStatus) goBuilder() buildgo.GoBuilder {
-	forceMake := true
-	if st.RevBranch == "release-branch.go1.20" {
-		// The concept of "broken ports" and -force flag didn't
-		// exist prior to Go 1.21. See go.dev/issue/56679.
-		// TODO: Remove this condition when Go 1.20 is no longer supported.
-		forceMake = false
-	}
+	goDevDLBootstrap := strings.HasPrefix(
+		st.conf.GoBootstrapURL(pool.NewGCEConfiguration().BuildEnv()), "https://go.dev/dl/")
 	return buildgo.GoBuilder{
-		Logger:     st,
-		BuilderRev: st.BuilderRev,
-		Conf:       st.conf,
-		Goroot:     "go",
-		Force:      forceMake,
+		Logger:           st,
+		BuilderRev:       st.BuilderRev,
+		Conf:             st.conf,
+		Goroot:           "go",
+		GoDevDLBootstrap: goDevDLBootstrap,
+		Force:            true,
 	}
 }
 
@@ -1300,12 +1297,22 @@ func (st *buildStatus) modulesEnv() (env []string) {
 	case pool.NewGCEConfiguration().BuildEnv() == nil || !pool.NewGCEConfiguration().BuildEnv().IsProd:
 		// Dev mode; use the system default.
 		env = append(env, "GOPROXY="+os.Getenv("GOPROXY"))
-	case st.conf.IsGCE():
+	case st.conf.IsGCE() && !migration.StopInternalModuleProxy:
 		// On GCE; the internal proxy is accessible, prefer that.
 		env = append(env, "GOPROXY="+internalModuleProxy())
 	default:
 		// Everything else uses the public proxy.
 		env = append(env, "GOPROXY=https://proxy.golang.org")
+
+		if migration.StopInternalModuleProxy {
+			// If the internal module proxy is stopped, we can't disable outbound
+			// network without also breaking downloading of module dependencies
+			// (since proxy.golang.org would be inaccessible). Disabling outbound
+			// network is a nice-to-have to detect tests that accidentally try to
+			// use the internet in -short test mode, and that functionality is
+			// handled by LUCI, so it's fine not to do it in the coordinator now.
+			env = append(env, "GO_DISABLE_OUTBOUND_NETWORK=0")
+		}
 	}
 
 	return env
