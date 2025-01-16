@@ -16,8 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
-func init() { mrand.Seed(time.Now().UnixNano()) }
-
 // FakeAWSClient provides a fake AWS Client used to test the AWS client
 // functionality.
 type FakeAWSClient struct {
@@ -38,12 +36,12 @@ func NewFakeAWSClient() *FakeAWSClient {
 	return &FakeAWSClient{
 		instances: make(map[string]*Instance),
 		instanceTypes: []*InstanceType{
-			&InstanceType{"ab.large", 10},
-			&InstanceType{"ab.xlarge", 20},
-			&InstanceType{"ab.small", 30},
+			{"ab.large", 10},
+			{"ab.xlarge", 20},
+			{"ab.small", 30},
 		},
 		serviceQuotas: map[serviceQuotaKey]int64{
-			serviceQuotaKey{QuotaCodeCPUOnDemand, QuotaServiceEC2}: 384,
+			{QuotaCodeCPUOnDemand, QuotaServiceEC2}: 384,
 		},
 	}
 }

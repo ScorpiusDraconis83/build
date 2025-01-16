@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.20 && (linux || darwin)
+//go:build linux || darwin
 
 package main
 
@@ -39,6 +39,13 @@ var (
 	sshAddr      = flag.String("ssh_addr", ":2222", "Address the gomote SSH server should listen on")
 	buildEnvName = flag.String("env", "", "The build environment configuration to use. Not required if running in dev mode locally or prod mode on GCE.")
 	mode         = flag.String("mode", "", "Valid modes are 'dev', 'prod', or '' for auto-detect. dev means localhost development, not be confused with staging on go-dashboard-dev, which is still the 'prod' mode.")
+)
+
+var Version string // set by linker -X
+
+const (
+	gomoteHost    = "gomote.golang.org"
+	gomoteSSHHost = "gomotessh.golang.org"
 )
 
 func main() {
@@ -85,8 +92,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reverse", rdv.HandleReverse)
 	mux.Handle("/revdial", revdial.ConnHandler())
-	mux.HandleFunc("/style.css", ui.HandleStyleCSS)
-	mux.HandleFunc("/", grpcHandlerFunc(grpcServer, ui.HandleStatusFunc(sp))) // Serve a status page.
+	mux.HandleFunc("/style.css", ui.Redirect(ui.HandleStyleCSS, gomoteSSHHost, gomoteHost))
+	mux.HandleFunc("/", ui.Redirect(grpcHandlerFunc(grpcServer, ui.HandleStatusFunc(sp, Version)), gomoteSSHHost, gomoteHost)) // Serve a status page.
 
 	sshServ, err := remote.NewSSHServer(*sshAddr, []byte(*hostKey), []byte(*pubKey), sshCA, sp, remote.EnableLUCIOption())
 	if err != nil {

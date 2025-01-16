@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/maintner"
@@ -23,6 +22,8 @@ import (
 	"golang.org/x/build/maintner/maintnerd/apipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 )
 
@@ -78,7 +79,7 @@ func TestFindTryWork(t *testing.T) {
 
 	// Just for interactive debugging. This is using live data.
 	// The stable tests are in TestTryWorkItem and TestTryBotStatus.
-	t.Logf("Current:\n%v", proto.MarshalTextString(res))
+	t.Logf("Current:\n%v", prototext.Format(res))
 
 	t1 := time.Now()
 	res2, err := s.GoFindTryWork(context.Background(), req)
@@ -224,7 +225,7 @@ func TestTryWorkItem(t *testing.T) {
 		}},
 
 		// Test that x/tools TryBots on gopls release branches are
-		// tested on tip and at least two supported releases. See issue 46156.
+		// tested on tip and two supported releases. See issue 46156.
 		{"tools", 316773, &gerrit.ChangeInfo{}, nil, &apipb.GerritTryWorkItem{
 			Project:     "tools",
 			Branch:      "gopls-release-branch.0.6",
@@ -235,17 +236,12 @@ func TestTryWorkItem(t *testing.T) {
 				"9995c6b50aa55c1cc1236d1d688929df512dad53",
 				"e67a58b7cb2b228e04477dfdb1aacd8348e63534",
 				"72ccabc99449b2cb5bb1438eb90244d55f7b02f5",
-				"619b8fd7d2c94af12933f409e962b99aa9263555",
-				"581603cb7d02019bbf4ff508014038f3120a3dcb",
 			},
-			GoBranch: []string{"master", "release-branch.go1.16", "release-branch.go1.15",
-				"release-branch.go1.19", "release-branch.go1.18"},
+			GoBranch: []string{"master", "release-branch.go1.16", "release-branch.go1.15"},
 			GoVersion: []*apipb.MajorMinor{
 				{Major: 1, Minor: 17},
 				{Major: 1, Minor: 16},
 				{Major: 1, Minor: 15},
-				{Major: 1, Minor: 19},
-				{Major: 1, Minor: 18},
 			},
 		}},
 

@@ -22,74 +22,72 @@ func archOsTeam(teamName string) *Entry {
 }
 
 var (
-	adonovan     = gh("adonovan")
-	agl          = gh("agl")
-	agnivade     = gh("agnivade")
-	alexbrainman = gh("alexbrainman")
-	amedee       = gh("cagedmantis")
-	austin       = gh("aclements")
-	bcmills      = gh("bcmills")
-	bradfitz     = gh("bradfitz")
-	cherryyz     = gh("cherrymui")
-	codyoss      = gh("codyoss")
-	dmitshur     = gh("dmitshur")
-	danderson    = gh("danderson")
-	drakkan      = gh("drakkan")
-	drchase      = gh("dr2chase")
-	dvyukov      = gh("dvyukov")
-	eliben       = gh("eliben")
-	filippo      = gh("FiloSottile")
-	findleyr     = gh("findleyr")
-	gri          = gh("griesemer")
-	hyangah      = gh("hyangah")
-	iant         = gh("ianlancetaylor")
-	iancottrell  = gh("ianthehat")
-	jamalc       = gh("jamalc")
-	jba          = gh("jba")
-	jbd          = gh("rakyll")
-	joetsai      = gh("dsnet")
-	julieqiu     = gh("julieqiu")
-	kardianos    = gh("kardianos")
-	katie        = gh("katiehockman")
-	kevinburke   = gh("kevinburke")
-	kele         = gh("kele")
-	khr          = gh("randall77")
-	martisch     = gh("martisch")
-	matloob      = gh("matloob")
-	mauri870     = gh("mauri870")
-	mdempsky     = gh("mdempsky")
-	mdlayher     = gh("mdlayher")
-	minux        = gh("minux")
-	mknyszek     = gh("mknyszek")
-	mpvl         = gh("mpvl")
-	mvdan        = gh("mvdan")
-	mwhudson     = gh("mwhudson")
-	neelance     = gh("neelance")
-	neild        = gh("neild")
-	nigeltao     = gh("nigeltao")
-	prattmic     = gh("prattmic")
-	pjw          = gh("pjweinb")
-	r            = gh("robpike")
-	rakoczy      = gh("toothrot")
-	roland       = gh("rolandshoemaker")
-	rsc          = gh("rsc")
-	sameer       = gh("Sajmani")
-	shinfan      = gh("shinfan")
-	suzmue       = gh("suzmue")
-	taking       = gh("timothy-king")
-	thanm        = gh("thanm")
-	tklauser     = gh("tklauser")
-	tombergan    = gh("tombergan")
-	zpavlinovic  = gh("zpavlinovic")
+	adonovan      = gh("adonovan")
+	agl           = gh("agl")
+	agnivade      = gh("agnivade")
+	alexbrainman  = gh("alexbrainman")
+	amedee        = gh("cagedmantis")
+	austin        = gh("aclements")
+	bradfitz      = gh("bradfitz")
+	cherryyz      = gh("cherrymui")
+	codyoss       = gh("codyoss")
+	dmitshur      = gh("dmitshur")
+	danderson     = gh("danderson")
+	drakkan       = gh("drakkan")
+	drchase       = gh("dr2chase")
+	dvyukov       = gh("dvyukov")
+	eliben        = gh("eliben")
+	filippo       = gh("FiloSottile")
+	findleyr      = gh("findleyr")
+	gri           = gh("griesemer")
+	hyangah       = gh("hyangah")
+	iant          = gh("ianlancetaylor")
+	iancottrell   = gh("ianthehat")
+	jba           = gh("jba")
+	jbd           = gh("rakyll")
+	joetsai       = gh("dsnet")
+	kardianos     = gh("kardianos")
+	katie         = gh("katiehockman")
+	kevinburke    = gh("kevinburke")
+	khr           = gh("randall77")
+	martisch      = gh("martisch")
+	matloob       = gh("matloob")
+	mauri870      = gh("mauri870")
+	mdempsky      = gh("mdempsky")
+	mdlayher      = gh("mdlayher")
+	minux         = gh("minux")
+	mknyszek      = gh("mknyszek")
+	mpvl          = gh("mpvl")
+	mvdan         = gh("mvdan")
+	mwhudson      = gh("mwhudson")
+	neelance      = gh("neelance")
+	neild         = gh("neild")
+	nigeltao      = gh("nigeltao")
+	prattmic      = gh("prattmic")
+	pjw           = gh("pjweinb")
+	r             = gh("robpike")
+	rakoczy       = gh("toothrot")
+	roland        = gh("rolandshoemaker")
+	rsc           = gh("rsc")
+	sameer        = gh("Sajmani")
+	samthanawalla = gh("samthanawalla")
+	shinfan       = gh("shinfan")
+	taking        = gh("timothy-king")
+	thanm         = gh("thanm")
+	tklauser      = gh("tklauser")
+	tombergan     = gh("tombergan")
+	zpavlinovic   = gh("zpavlinovic")
 
-	compilerTeam = gh("golang/compiler")
-	fuzzingTeam  = gh("golang/fuzzing")
-	pkgsiteTeam  = gh("golang/pkgsite")
-	releaseTeam  = gh("golang/release")
-	runtimeTeam  = gh("golang/runtime")
-	securityTeam = gh("golang/security")
-	toolsTeam    = gh("golang/tools-team")
-	vulndbTeam   = gh("golang/vulndb")
+	compilerTeam  = gh("golang/compiler")
+	fuzzingTeam   = gh("golang/fuzzing")
+	oscarTeam     = gh("golang/oscar-team")
+	pkgsiteTeam   = gh("golang/pkgsite")
+	releaseTeam   = gh("golang/release")
+	runtimeTeam   = gh("golang/runtime")
+	securityTeam  = gh("golang/security")
+	telemetryTeam = gh("golang/telemetry")
+	toolsTeam     = gh("golang/tools-team")
+	vulndbTeam    = gh("golang/vulndb")
 )
 
 // entries is a map of <repo name>/<path>, <domain>, or <branch> to Owner
@@ -188,7 +186,7 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{mvdan},
 	},
 	"go/src/cmd/go": {
-		Primary:   []Owner{bcmills, matloob},
+		Primary:   []Owner{matloob, samthanawalla},
 		Secondary: []Owner{rsc, iant},
 	},
 	"go/src/cmd/gofmt": {
@@ -485,6 +483,18 @@ var entries = map[string]*Entry{
 		Primary:   []Owner{runtimeTeam},
 		Secondary: []Owner{rsc, iant},
 	},
+	"go/src/internal/runtime/atomic": {
+		Primary:   []Owner{runtimeTeam},
+		Secondary: []Owner{austin, khr, mknyszek, mauri870},
+	},
+	"go/src/internal/runtime/sys": {
+		Primary:   []Owner{runtimeTeam},
+		Secondary: []Owner{austin, khr},
+	},
+	"go/src/internal/runtime/syscall": {
+		Primary:   []Owner{runtimeTeam},
+		Secondary: []Owner{prattmic, mknyszek, austin},
+	},
 	"go/src/internal/singleflight": {
 		Primary: []Owner{bradfitz, iant},
 	},
@@ -586,7 +596,7 @@ var entries = map[string]*Entry{
 		Primary: []Owner{neild, rsc},
 	},
 	"go/src/os": {
-		Primary: []Owner{rsc, r, iant, bradfitz, gri},
+		Primary: []Owner{rsc, iant, bradfitz, gri},
 	},
 	"go/src/os/exec": {
 		Primary: []Owner{bradfitz, iant},
@@ -632,18 +642,6 @@ var entries = map[string]*Entry{
 		Primary:   []Owner{thanm},
 		Secondary: []Owner{compilerTeam},
 	},
-	"go/src/runtime/internal/atomic": {
-		Primary:   []Owner{runtimeTeam},
-		Secondary: []Owner{austin, khr, mknyszek, mauri870},
-	},
-	"go/src/runtime/internal/sys": {
-		Primary:   []Owner{runtimeTeam},
-		Secondary: []Owner{austin, khr},
-	},
-	"go/src/runtime/internal/syscall": {
-		Primary:   []Owner{runtimeTeam},
-		Secondary: []Owner{prattmic, mknyszek, austin},
-	},
 	"go/src/runtime/metrics": {
 		Primary:   []Owner{runtimeTeam},
 		Secondary: []Owner{mknyszek, prattmic},
@@ -687,7 +685,7 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{iant, bradfitz, tklauser},
 	},
 	"go/src/testing": {
-		Primary:   []Owner{bcmills},
+		Primary:   []Owner{adonovan, neild},
 		Secondary: []Owner{mpvl},
 	},
 	"go/src/testing/quick": {
@@ -729,6 +727,9 @@ var entries = map[string]*Entry{
 	"go/misc/wasm": {
 		Primary: wasmOwners,
 	},
+	"go/lib/wasm": {
+		Primary: wasmOwners,
+	},
 
 	// golang.org/x/ repositories.
 	"arch": {
@@ -761,7 +762,7 @@ var entries = map[string]*Entry{
 	},
 	"debug": {
 		Primary:   []Owner{runtimeTeam},
-		Secondary: []Owner{hyangah, khr},
+		Secondary: []Owner{khr},
 	},
 	"exp/vulncheck": {
 		Primary: []Owner{vulndbTeam},
@@ -770,7 +771,7 @@ var entries = map[string]*Entry{
 		Primary: []Owner{hyangah},
 	},
 	"mod": {
-		Primary: []Owner{bcmills, matloob},
+		Primary: []Owner{matloob, samthanawalla},
 	},
 	"net": {
 		Primary: []Owner{neild, iant},
@@ -798,6 +799,9 @@ var entries = map[string]*Entry{
 	"oauth2": {
 		Secondary: []Owner{jbd, shinfan, codyoss},
 	},
+	"oscar": {
+		Primary: []Owner{oscarTeam},
+	},
 	"perf": {
 		Primary: []Owner{runtimeTeam, releaseTeam},
 	},
@@ -805,7 +809,7 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{kevinburke},
 	},
 	"sync": {
-		Primary: []Owner{bcmills},
+		Primary: []Owner{adonovan},
 	},
 	"sys/unix": {
 		Primary:   []Owner{runtimeTeam},
@@ -819,7 +823,7 @@ var entries = map[string]*Entry{
 		Primary: []Owner{mpvl},
 	},
 	"telemetry": {
-		Primary:   []Owner{pjw, hyangah, findleyr},
+		Primary:   []Owner{telemetryTeam},
 		Secondary: []Owner{toolsTeam},
 	},
 	// default owners of x/tools/...
@@ -831,8 +835,7 @@ var entries = map[string]*Entry{
 		Primary: []Owner{adonovan},
 	},
 	"tools/cmd/auth": {
-		Primary:   []Owner{bcmills},
-		Secondary: []Owner{matloob},
+		Secondary: []Owner{matloob, samthanawalla},
 	},
 	"tools/cmd/godoc": {
 		Secondary: []Owner{agnivade, bradfitz, gri, kevinburke},
@@ -848,19 +851,19 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{mvdan},
 	},
 	"tools/go/analysis": {
-		Primary:   []Owner{taking},
+		Primary:   []Owner{adonovan, taking},
 		Secondary: []Owner{matloob, zpavlinovic},
 	},
 	"tools/go/ast": {
-		Primary:   []Owner{gri},
+		Primary:   []Owner{adonovan, gri},
 		Secondary: []Owner{dmitshur},
 	},
 	"tools/go/buildutil": {
-		Primary:   []Owner{bcmills, matloob},
+		Primary:   []Owner{adonovan, matloob},
 		Secondary: []Owner{dmitshur},
 	},
 	"tools/go/callgraph": {
-		Primary:   []Owner{zpavlinovic},
+		Primary:   []Owner{adonovan, zpavlinovic},
 		Secondary: []Owner{taking, toolsTeam},
 	},
 	"tools/go/gcexportdata": {
@@ -875,28 +878,26 @@ var entries = map[string]*Entry{
 		Primary: []Owner{matloob},
 	},
 	"tools/go/loader": {
-		Primary: []Owner{matloob},
+		Primary: []Owner{adonovan, matloob},
 	},
 	"tools/go/packages": {
-		Primary: []Owner{matloob},
+		Primary:   []Owner{matloob},
+		Secondary: []Owner{adonovan},
 	},
 	"tools/go/ssa": {
-		Primary:   []Owner{taking},
+		Primary:   []Owner{taking, adonovan},
 		Secondary: []Owner{findleyr},
-	},
-	"tools/go/vcs": {
-		Secondary: []Owner{bcmills, matloob},
 	},
 	"tools/imports": {
 		Primary: []Owner{toolsTeam},
 	},
 	"tools/internal/analysisinternal": {
-		Primary:   []Owner{matloob},
+		Primary:   []Owner{adonovan, matloob},
 		Secondary: []Owner{toolsTeam},
 	},
 	"tools/internal/apidiff": {
 		Primary:   []Owner{jba},
-		Secondary: []Owner{matloob, bcmills},
+		Secondary: []Owner{matloob},
 	},
 	"tools/internal/fastwalk": {
 		Primary: []Owner{toolsTeam},
@@ -914,9 +915,6 @@ var entries = map[string]*Entry{
 		Primary:   []Owner{iancottrell},
 		Secondary: []Owner{findleyr, jba},
 	},
-	"tools/internal/testenv": {
-		Primary: []Owner{bcmills},
-	},
 	"tools/internal/tool": {
 		Primary: []Owner{iancottrell},
 	},
@@ -931,10 +929,10 @@ var entries = map[string]*Entry{
 	},
 	"tools/refactor": {
 		Primary:   []Owner{toolsTeam},
-		Secondary: []Owner{findleyr, suzmue},
+		Secondary: []Owner{findleyr, adonovan},
 	},
 	"tools/txtar": {
-		Primary: []Owner{bcmills, matloob},
+		Primary: []Owner{matloob},
 	},
 	"pkgsite": {
 		Primary: []Owner{pkgsiteTeam},
@@ -978,7 +976,8 @@ var entries = map[string]*Entry{
 		Secondary: []Owner{cherryyz},
 	},
 	"vscode-go": {
-		Primary: []Owner{toolsTeam},
+		Primary:   []Owner{toolsTeam},
+		Secondary: []Owner{hyangah},
 	},
 
 	// These components are domains, not Go packages.
@@ -1024,5 +1023,5 @@ var wasmOwners = []Owner{neelance, cherryyz}
 
 var modProxyOwners = &Entry{
 	Primary:   []Owner{toolsTeam},
-	Secondary: []Owner{suzmue, findleyr, hyangah},
+	Secondary: []Owner{samthanawalla, findleyr, hyangah},
 }

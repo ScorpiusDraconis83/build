@@ -9,6 +9,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	goversion "go/version"
 	"io"
 	"mime"
 	"net/http"
@@ -287,7 +288,7 @@ func mapCoordinators(users []string, f func(*gophers.Person) string) ([]string, 
 }
 
 // CheckCoordinators checks that all users are known
-// and have required information (name, Gerrit email).
+// and have required information (name, Gerrit email, GitHub user name).
 func CheckCoordinators(users []string) error {
 	var report strings.Builder
 	for _, user := range users {
@@ -308,8 +309,12 @@ func lookupCoordinator(user string) (*gophers.Person, error) {
 	}
 	if person == nil {
 		return nil, fmt.Errorf("unknown username %q: no @golang or @google account", user)
-	} else if person.Name == "" {
+	}
+	if person.Name == "" {
 		return nil, fmt.Errorf("release coordinator %q is missing a name", person.Gerrit)
+	}
+	if person.GitHub == "" {
+		return nil, fmt.Errorf("release coordinator %q is missing github user name", person.Gerrit)
 	}
 	return person, nil
 }
@@ -332,6 +337,7 @@ type MailContent struct {
 // which must be one of these types:
 //   - releaseAnnouncement for a release announcement
 //   - releasePreAnnouncement for a release pre-announcement
+//   - goplsPrereleaseAnnouncement for a gopls pre-announcement
 func announcementMail(data any) (MailContent, error) {
 	// Select the appropriate template name.
 	var name string
@@ -362,6 +368,16 @@ func announcementMail(data any) (MailContent, error) {
 		}
 	case releasePreAnnouncement:
 		name = "pre-announce-minor.md"
+	case goplsReleaseAnnouncement:
+		name = "gopls-announce.md"
+	case goplsPrereleaseAnnouncement:
+		name = "gopls-pre-announce.md"
+	case vscodeGoReleaseAnnouncement:
+		name = "vscode-go-announce.md"
+	case vscodeGoPrereleaseAnnouncement:
+		name = "vscode-go-pre-announce.md"
+	case vscodeGoInsiderAnnouncement:
+		name = "vscode-go-insider-announce.md"
 	default:
 		return MailContent{}, fmt.Errorf("unknown template data type %T", data)
 	}
@@ -429,6 +445,14 @@ var announceTmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 	},
 
+	// shortcommit is used to shorten git commit hashes.
+	"shortcommit": func(v string) string {
+		if len(v) > 7 {
+			return v[:7]
+		}
+		return v
+	},
+
 	// short and helpers below manipulate valid Go version strings
 	// for the current needs of the announcement templates.
 	"short": func(v string) string { return strings.TrimPrefix(v, "go") },
@@ -441,6 +465,10 @@ var announceTmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 		return fmt.Sprintf("1.%d", x), nil
 	},
+	// atLeast reports whether v1 >= v2.
+	"atLeast": func(v1, v2 string) bool {
+		return goversion.Compare(v1, v2) >= 0
+	},
 	// build extracts the pre-release build number of a valid Go version.
 	// For example, build("go1.19beta2") == "2".
 	"build": func(v string) (string, error) {
@@ -451,7 +479,17 @@ var announceTmpl = template.Must(template.New("").Funcs(template.FuncMap{
 		}
 		return "", fmt.Errorf("internal error: unhandled pre-release Go version %q", v)
 	},
-}).ParseFS(tmplDir, "template/announce-*.md", "template/pre-announce-minor.md"))
+}).ParseFS(tmplDir,
+	"template/announce-*.md",
+	"template/pre-announce-minor.md",
+	// Gopls release announcements.
+	"template/gopls-announce.md",
+	"template/gopls-pre-announce.md",
+	// VSCode Go release announcements.
+	"template/vscode-go-pre-announce.md",
+	"template/vscode-go-insider-announce.md",
+	"template/vscode-go-announce.md",
+))
 
 //go:embed template
 var tmplDir embed.FS
@@ -657,8 +695,8 @@ func renderMarkdown(r io.Reader) (html, text string, _ error) {
 // of our test data, since without a browser plain text is more readable than HTML.)
 //
 // The output is mostly plain text that doesn't preserve Markdown syntax (for example,
-// `code` is rendered without backticks), though there is very lightweight formatting
-// applied (links are written as "text <URL>").
+// `code` is rendered without backticks, code blocks aren't indented, and so on),
+// though there is very lightweight formatting applied (links are written as "text <URL>").
 //
 // We can in theory choose to delete this renderer at any time if its maintenance costs
 // start to outweight its benefits, since Markdown by definition is designed to be human
@@ -681,7 +719,7 @@ func (markdownToTextRenderer) Render(w io.Writer, source []byte, n ast.Node) err
 				switch n.PreviousSibling().Kind() {
 				default:
 					fmt.Fprint(w, "\n\n")
-				case ast.KindCodeBlock:
+				case ast.KindCodeBlock, ast.KindFencedCodeBlock:
 					// A code block always ends with a newline, so only need one more.
 					fmt.Fprintln(w)
 				}
@@ -703,11 +741,15 @@ func (markdownToTextRenderer) Render(w io.Writer, source []byte, n ast.Node) err
 					// If we're in a list, indent accordingly.
 					fmt.Fprint(w, strings.Repeat("\t", len(markers)))
 				}
-			case *ast.CodeBlock:
-				indent := strings.Repeat("\t", len(markers)+1) // Indent if in a list, plus one more since it's a code block.
+			case *ast.CodeBlock, *ast.FencedCodeBlock:
+				// Code blocks are printed as is in plain text.
 				for i := 0; i < n.Lines().Len(); i++ {
 					s := n.Lines().At(i)
-					fmt.Fprint(w, indent, string(source[s.Start:s.Stop]))
+					if i != 0 {
+						// If we're in a list, indent inner lines accordingly.
+						fmt.Fprint(w, strings.Repeat("\t", len(markers)))
+					}
+					fmt.Fprint(w, string(source[s.Start:s.Stop]))
 				}
 			case *ast.AutoLink:
 				// Auto-links are printed as is in plain text.

@@ -37,10 +37,15 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
+	"go.chromium.org/luci/auth"
+	buildbucketpb "go.chromium.org/luci/buildbucket/proto"
+	"go.chromium.org/luci/grpc/prpc"
+	"go.chromium.org/luci/hardcoded/chromeinfra"
 	"golang.org/x/build/buildenv"
 	"golang.org/x/build/buildlet"
 	builddash "golang.org/x/build/cmd/coordinator/internal/dashboard"
 	"golang.org/x/build/cmd/coordinator/internal/legacydash"
+	"golang.org/x/build/cmd/coordinator/internal/lucipoll"
 	"golang.org/x/build/cmd/coordinator/protos"
 	"golang.org/x/build/dashboard"
 	"golang.org/x/build/gerrit"
@@ -56,6 +61,7 @@ import (
 	gomoteprotos "golang.org/x/build/internal/gomote/protos"
 	"golang.org/x/build/internal/https"
 	"golang.org/x/build/internal/metrics"
+	"golang.org/x/build/internal/migration"
 	"golang.org/x/build/internal/secret"
 	"golang.org/x/build/kubernetes/gke"
 	"golang.org/x/build/maintner/maintnerd/apipb"
@@ -174,13 +180,28 @@ func hostPathHandler(h http.Handler) http.Handler {
 
 // A linkRewriter is a ResponseWriter that rewrites links in HTML output.
 // It rewrites relative links /foo to be /host/foo, and it rewrites any link
-// https://h/foo, where h is in validHosts, to be /h/foo. This corrects the
-// links to have the right form for the test server.
+// https://h/foo or //h/foo, where h is in validHosts, to be /h/foo.
+// This corrects the links to have the right form for the local development mode.
 type linkRewriter struct {
 	http.ResponseWriter
 	host string
 	buf  []byte
 	ct   string // content-type
+}
+
+func (r *linkRewriter) WriteHeader(code int) {
+	if l := r.Header().Get("Location"); l != "" {
+		if u, err := url.Parse(l); err == nil {
+			if u.Host == "" {
+				u.Path = "/" + r.host + u.Path
+			} else if validHosts[u.Host] {
+				u.Path = "/" + u.Host + u.Path
+				u.Scheme, u.Host = "", ""
+			}
+			r.Header().Set("Location", u.String())
+		}
+	}
+	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *linkRewriter) Write(data []byte) (int, error) {
@@ -200,12 +221,12 @@ func (r *linkRewriter) Write(data []byte) (int, error) {
 }
 
 func (r *linkRewriter) Flush() {
-	repl := []string{
-		`href="/`, `href="/` + r.host + `/`,
-	}
+	var repl []string
 	for host := range validHosts {
 		repl = append(repl, `href="https://`+host, `href="/`+host)
+		repl = append(repl, `href="//`+host, `href="/`+host) // Handle scheme-less URLs.
 	}
+	repl = append(repl, `href="/`, `href="/`+r.host+`/`)
 	strings.NewReplacer(repl...).WriteString(r.ResponseWriter, string(r.buf))
 	r.buf = nil
 }
@@ -247,22 +268,26 @@ func main() {
 
 	gce := pool.NewGCEConfiguration()
 
-	goKubeClient, err := gke.NewClient(context.Background(),
-		gce.BuildEnv().KubeServices.Name,
-		gce.BuildEnv().KubeServices.Location(),
-		gke.OptNamespace(gce.BuildEnv().KubeServices.Namespace),
-		gke.OptProject(gce.BuildEnv().ProjectName),
-		gke.OptTokenSource(gce.GCPCredentials().TokenSource))
-	if err != nil {
-		log.Fatalf("connecting to GKE failed: %v", err)
+	if gce.BuildEnv().KubeServices.Name != "" {
+		goKubeClient, err := gke.NewClient(context.Background(),
+			gce.BuildEnv().KubeServices.Name,
+			gce.BuildEnv().KubeServices.Location(),
+			gke.OptNamespace(gce.BuildEnv().KubeServices.Namespace),
+			gke.OptProject(gce.BuildEnv().ProjectName),
+			gke.OptTokenSource(gce.GCPCredentials().TokenSource))
+		if err != nil {
+			log.Fatalf("connecting to GKE failed: %v", err)
+		}
+		go monitorGitMirror(goKubeClient)
+	} else {
+		log.Println("Kubernetes services disabled due to empty KubeServices.Name")
 	}
-	go monitorGitMirror(goKubeClient)
 
 	if *mode == "prod" || (*mode == "dev" && *devEnableEC2) {
 		// TODO(golang.org/issues/38337) the coordinator will use a package scoped pool
 		// until the coordinator is refactored to not require them.
-		ec2Pool := mustCreateEC2BuildletPool(sc, sp.IsSession)
-		defer ec2Pool.Close()
+		ec2PoolClose := mustCreateEC2BuildletPool(sc, sp.IsSession)
+		defer ec2PoolClose()
 	}
 
 	if *mode == "dev" {
@@ -341,8 +366,32 @@ func main() {
 	// grpcServer is a shared gRPC server. It is global, as it needs to be used in places that aren't factored otherwise.
 	grpcServer := grpc.NewServer(opts...)
 
-	dashV1 := legacydash.Handler(gce.GoDSClient(), maintnerClient, string(masterKey()), grpcServer)
-	dashV2 := &builddash.Handler{Datastore: gce.GoDSClient(), Maintner: maintnerClient}
+	var luciHTTPClient *http.Client
+	switch *mode {
+	case "prod":
+		var err error
+		luciHTTPClient, err = auth.NewAuthenticator(context.Background(), auth.SilentLogin, auth.Options{GCEAllowAsDefault: true}).Client()
+		if err != nil {
+			log.Fatalln("luci/auth.NewAuthenticator:", err)
+		}
+	case "dev":
+		var err error
+		luciHTTPClient, err = auth.NewAuthenticator(context.Background(), auth.SilentLogin, chromeinfra.DefaultAuthOptions()).Client()
+		if err != nil {
+			log.Fatalln("luci/auth.NewAuthenticator:", err)
+		}
+	}
+	buildersCl := buildbucketpb.NewBuildersClient(&prpc.Client{
+		C:    luciHTTPClient,
+		Host: "cr-buildbucket.appspot.com",
+	})
+	buildsCl := buildbucketpb.NewBuildsClient(&prpc.Client{
+		C:    luciHTTPClient,
+		Host: "cr-buildbucket.appspot.com",
+	})
+	luciPoll := lucipoll.NewService(maintnerClient, buildersCl, buildsCl)
+	dashV1 := legacydash.Handler(gce.GoDSClient(), maintnerClient, luciPoll, string(masterKey()), grpcServer)
+	dashV2 := &builddash.Handler{Datastore: gce.GoDSClient(), Maintner: maintnerClient, LUCI: luciPoll}
 	gs := &gRPCServer{dashboardURL: "https://build.golang.org"}
 	setSessionPool(sp)
 	gomoteServer := gomote.New(sp, sched, sshCA, gomoteBucket, mustStorageClient())
@@ -364,7 +413,9 @@ func main() {
 	if *mode == "dev" {
 		// TODO(crawshaw): do more in dev mode
 		gce.BuildletPool().SetEnabled(*devEnableGCE)
-		go findWorkLoop()
+		if *devEnableGCE || *devEnableEC2 {
+			go findWorkLoop()
+		}
 	} else {
 		go gce.BuildletPool().CleanUpOldVMs()
 
@@ -479,7 +530,7 @@ func stagingClusterBuilders() map[string]*dashboard.BuildConfig {
 		"linux-amd64",
 		"linux-amd64-sid",
 		"linux-amd64-clang",
-		"js-wasm",
+		"js-wasm-node18",
 	} {
 		if c, ok := dashboard.Builders[name]; ok {
 			m[name] = c
@@ -2198,7 +2249,12 @@ func mustCreateSecretClientOnGCE() *secret.Client {
 	return secret.MustNewClient()
 }
 
-func mustCreateEC2BuildletPool(sc *secret.Client, isRemoteBuildlet func(instName string) bool) *pool.EC2Buildlet {
+func mustCreateEC2BuildletPool(sc *secret.Client, isRemoteBuildlet func(instName string) bool) (close func()) {
+	if migration.StopEC2BuildletPool {
+		log.Println("not creating EC2 buildlet pool")
+		return func() {}
+	}
+
 	awsKeyID, err := sc.Retrieve(context.Background(), secret.NameAWSKeyID)
 	if err != nil {
 		log.Fatalf("unable to retrieve secret %q: %s", secret.NameAWSKeyID, err)
@@ -2218,7 +2274,7 @@ func mustCreateEC2BuildletPool(sc *secret.Client, isRemoteBuildlet func(instName
 	if err != nil {
 		log.Fatalf("unable to create EC2 buildlet pool: %s", err)
 	}
-	return ec2Pool
+	return ec2Pool.Close
 }
 
 func mustRetrieveSSHCertificateAuthority() (privateKey []byte) {

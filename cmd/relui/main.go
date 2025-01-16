@@ -15,17 +15,15 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/mail"
 	"net/url"
 	"strings"
-	"time"
 
 	cloudbuild "cloud.google.com/go/cloudbuild/apiv1/v2"
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
-	"github.com/google/go-github/github"
+	"github.com/google/go-github/v48/github"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/shurcooL/githubv4"
 	"go.chromium.org/luci/auth"
@@ -36,9 +34,8 @@ import (
 	"golang.org/x/build/buildlet"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal/access"
-	gomotepb "golang.org/x/build/internal/gomote/protos"
+	"golang.org/x/build/internal/criadb"
 	"golang.org/x/build/internal/https"
-	"golang.org/x/build/internal/iapclient"
 	"golang.org/x/build/internal/metrics"
 	"golang.org/x/build/internal/relui"
 	"golang.org/x/build/internal/relui/db"
@@ -74,10 +71,12 @@ var (
 	swarmingAccount = flag.String("swarming-account", "", "Service account to use for Swarming tasks")
 	swarmingPool    = flag.String("swarming-pool", "", "Swarming pool to run tasks in")
 	swarmingRealm   = flag.String("swarming-realm", "", "Swarming realm to run tasks in")
+
+	buildbucketHost = flag.String("buildbucket-host", "", "Buildbucket host to use for tasks")
+	criaService     = flag.String("cria-service", "chrome-infra-auth", "CrIA service name")
 )
 
 func main() {
-	rand.Seed(time.Now().Unix())
 	if err := secret.InitFlagSupport(context.Background()); err != nil {
 		log.Fatalln(err)
 	}
@@ -90,8 +89,16 @@ func main() {
 	addressVarFlag(&schedMail.From, "schedule-mail-from", "The From address to use for the scheduled workflow failure mail.")
 	addressVarFlag(&schedMail.To, "schedule-mail-to", "The To address to use for the scheduled workflow failure mail.")
 	addressListVarFlag(&schedMail.BCC, "schedule-mail-bcc", "The BCC address list to use for the scheduled workflow failure mail.")
+	var goplsAnnMail task.MailHeader
+	addressVarFlag(&goplsAnnMail.From, "gopls-announce-mail-from", "The From address to use for the gopls (pre-)announcement mail.")
+	addressVarFlag(&goplsAnnMail.To, "gopls-announce-mail-to", "The To address to use for the gopls (pre-)announcement mail.")
+	var vscodeGoAnnMail task.MailHeader
+	addressVarFlag(&vscodeGoAnnMail.From, "vscode-go-announce-mail-from", "The From address to use for the vscode-go (pre-)announcement mail.")
+	addressVarFlag(&vscodeGoAnnMail.To, "vscode-go-announce-mail-to", "The To address to use for the vscode-go (pre-)announcement mail.")
 	var twitterAPI secret.TwitterCredentials
 	secret.JSONVarFlag(&twitterAPI, "twitter-api-secret", "Twitter API secret to use for workflows involving tweeting.")
+	var mastodonAPI secret.MastodonCredentials
+	secret.JSONVarFlag(&mastodonAPI, "mastodon-api-secret", "Mastodon API secret to use for workflows involving posting.")
 	masterKey := secret.Flag("builder-master-key", "Builder master key")
 	githubToken := secret.Flag("github-token", "GitHub API token")
 	https.RegisterFlags(flag.CommandLine)
@@ -134,29 +141,28 @@ func main() {
 	gitClient := &task.Git{}
 	gitClient.UseOAuth2Auth(creds.TokenSource)
 	mailFunc := task.NewSendGridMailClient(*sendgridAPIKey).SendMail
+	var mastodonClient task.Poster
+	if mastodonAPI != (secret.MastodonCredentials{}) {
+		var err error
+		mastodonClient, err = task.NewMastodonClient(mastodonAPI)
+		if err != nil {
+			log.Fatalln("task.NewMastodonClient:", err)
+		}
+	}
 	commTasks := task.CommunicationTasks{
 		AnnounceMailTasks: task.AnnounceMailTasks{
 			SendMail:           mailFunc,
 			AnnounceMailHeader: annMail,
 		},
-		TweetTasks: task.TweetTasks{
-			TwitterClient: task.NewTwitterClient(twitterAPI),
+		SocialMediaTasks: task.SocialMediaTasks{
+			TwitterClient:  task.NewTwitterClient(twitterAPI),
+			MastodonClient: mastodonClient,
 		},
 	}
 	dh := relui.NewDefinitionHolder()
 	userPassAuth := buildlet.UserPass{
 		Username: "user-relui",
 		Password: key(*masterKey, "user-relui"),
-	}
-	cc, err := iapclient.GRPCClient(ctx, "build.golang.org:443")
-	if err != nil {
-		log.Fatalf("Could not connect to coordinator: %v", err)
-	}
-	coordinator := &buildlet.GRPCCoordinatorClient{
-		Client: gomotepb.NewGomoteServiceClient(cc),
-	}
-	if _, err := coordinator.Client.Authenticate(ctx, &gomotepb.AuthenticateRequest{}); err != nil {
-		log.Fatalf("Broken coordinator client: %v", err)
 	}
 	gcsClient, err := storage.NewClient(ctx)
 	if err != nil {
@@ -173,36 +179,41 @@ func main() {
 		ScriptAccount: *cloudBuildAccount,
 		ScratchURL:    *scratchFilesBase + "/build-outputs",
 	}
-	swarmingClient, err := swarming.NewClient(ctx, swarming.ClientOptions{
-		ServiceURL: *swarmingURL,
-		Auth: auth.Options{
-			GCEAllowAsDefault: true,
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
+	var swarmingClient swarming.Client
+	if *swarmingURL != "" {
+		var err error
+		swarmingClient, err = swarming.NewClient(ctx, swarming.ClientOptions{
+			ServiceURL: *swarmingURL,
+			Auth: auth.Options{
+				GCEAllowAsDefault: true,
+			},
+		})
+		if err != nil {
+			log.Fatalln("swarming.NewClient:", err)
+		}
 	}
-	luciHTTPClient, err := auth.NewAuthenticator(ctx, auth.SilentLogin, auth.Options{GCEAllowAsDefault: true}).Client()
-	if err != nil {
-		log.Fatal(err)
-	}
-	buildsClient := pb.NewBuildsPRPCClient(&prpc.Client{
-		C:    luciHTTPClient,
-		Host: "cr-buildbucket.appspot.com",
-	})
-	buildersClient := pb.NewBuildersPRPCClient(&prpc.Client{
-		C:    luciHTTPClient,
-		Host: "cr-buildbucket.appspot.com",
-	})
-	buildBucketClient := &task.RealBuildBucketClient{
-		BuildersClient: buildersClient,
-		BuildsClient:   buildsClient,
+	var buildBucketClient task.BuildBucketClient
+	if *buildbucketHost != "" {
+		luciHTTPClient, err := auth.NewAuthenticator(ctx, auth.SilentLogin, auth.Options{GCEAllowAsDefault: true}).Client()
+		if err != nil {
+			log.Fatalln("auth.NewAuthenticator:", err)
+		}
+		buildBucketClient = &task.RealBuildBucketClient{
+			BuildersClient: pb.NewBuildersClient(&prpc.Client{
+				C:    luciHTTPClient,
+				Host: *buildbucketHost,
+			}),
+			BuildsClient: pb.NewBuildsClient(&prpc.Client{
+				C:    luciHTTPClient,
+				Host: *buildbucketHost,
+			}),
+		}
 	}
 
 	var dbPool db.PGDBTX
 	dbPool, err = pgxpool.Connect(ctx, *pgConnect)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln("pgxpool.Connect:", err)
 	}
 	defer dbPool.Close()
 	dbPool = &relui.MetricsDB{dbPool}
@@ -229,8 +240,7 @@ func main() {
 		GerritProject:        "go",
 		GerritHTTPClient:     oauth2.NewClient(ctx, creds.TokenSource),
 		PrivateGerritClient:  privateGerritClient,
-		PrivateGerritProject: "golang/go-private",
-		CreateBuildlet:       coordinator.CreateBuildlet,
+		PrivateGerritProject: "go",
 		SignService:          signServer,
 		GCSClient:            gcsClient,
 		ScratchFS: &task.ScratchFS{
@@ -258,11 +268,12 @@ func main() {
 		ApproveAction: relui.ApproveActionDep(dbPool),
 	}
 	githubHTTPClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: *githubToken}))
+	githubClient := &task.GitHubClient{
+		V3: github.NewClient(githubHTTPClient),
+		V4: githubv4.NewClient(githubHTTPClient),
+	}
 	milestoneTasks := &task.MilestoneTasks{
-		Client: &task.GitHubClient{
-			V3: github.NewClient(githubHTTPClient),
-			V4: githubv4.NewClient(githubHTTPClient),
-		},
+		Client:        githubClient,
 		RepoOwner:     "golang",
 		RepoName:      "go",
 		ApproveAction: relui.ApproveActionDep(dbPool),
@@ -277,7 +288,12 @@ func main() {
 			Branch:    "main",
 		},
 	}
-	if err := relui.RegisterReleaseWorkflows(ctx, dh, buildTasks, milestoneTasks, versionTasks, commTasks); err != nil {
+	cycleTasks := task.ReleaseCycleTasks{
+		Gerrit:        gerritClient,
+		GitHub:        githubClient,
+		ApproveAction: relui.ApproveActionDep(dbPool),
+	}
+	if err := relui.RegisterReleaseWorkflows(ctx, dh, buildTasks, milestoneTasks, versionTasks, cycleTasks, commTasks); err != nil {
 		log.Fatalf("RegisterReleaseWorkflows: %v", err)
 	}
 
@@ -300,11 +316,34 @@ func main() {
 	}
 	dh.RegisterDefinition("Update x/crypto NSS root bundle", bundleTasks.NewDefinition())
 
+	releaseVSCodeGoTasks := task.ReleaseVSCodeGoTasks{
+		GitHub:             githubClient,
+		Gerrit:             gerritClient,
+		CloudBuild:         cloudBuildClient,
+		ApproveAction:      relui.ApproveActionDep(dbPool),
+		SendMail:           mailFunc,
+		AnnounceMailHeader: vscodeGoAnnMail,
+	}
+	dh.RegisterDefinition("Create a vscode-go release candidate", releaseVSCodeGoTasks.NewPrereleaseDefinition())
+	dh.RegisterDefinition("Release a vscode-go stable version", releaseVSCodeGoTasks.NewReleaseDefinition())
+	dh.RegisterDefinition("Release a vscode-go insider version", releaseVSCodeGoTasks.NewInsiderDefinition())
+
 	tagTelemetryTasks := &task.TagTelemetryTasks{
 		Gerrit:     gerritClient,
 		CloudBuild: cloudBuildClient,
 	}
 	dh.RegisterDefinition("Tag a new version of x/telemetry/config (if necessary)", tagTelemetryTasks.NewDefinition())
+
+	goplsTasks := task.ReleaseGoplsTasks{
+		Github:             githubClient,
+		Gerrit:             gerritClient,
+		CloudBuild:         cloudBuildClient,
+		SendMail:           mailFunc,
+		AnnounceMailHeader: goplsAnnMail,
+		ApproveAction:      relui.ApproveActionDep(dbPool),
+	}
+	dh.RegisterDefinition("Prepare a pre-release gopls candidate", goplsTasks.NewPrereleaseDefinition())
+	dh.RegisterDefinition("Release gopls", goplsTasks.NewReleaseDefinition())
 
 	privateSyncTask := &task.PrivateMasterSyncTask{
 		Git:              gitClient,
@@ -312,6 +351,19 @@ func main() {
 		Ref:              "public",
 	}
 	dh.RegisterDefinition("Sync go-private master branch with public", privateSyncTask.NewDefinition())
+
+	privateXPatchTask := &task.PrivXPatch{
+		Git:           gitClient,
+		PublicGerrit:  gerritClient,
+		PrivateGerrit: privateGerritClient,
+		PublicRepoURL: func(repo string) string {
+			return "https://go.googlesource.com/" + repo
+		},
+		ApproveAction:      relui.ApproveActionDep(dbPool),
+		SendMail:           mailFunc,
+		AnnounceMailHeader: annMail,
+	}
+	dh.RegisterDefinition("Publish a private patch to a x/ repo", privateXPatchTask.NewDefinition(tagTasks))
 
 	var base *url.URL
 	if *baseURL != "" {
@@ -331,15 +383,26 @@ func main() {
 	if err := w.ResumeAll(ctx); err != nil {
 		log.Printf("w.ResumeAll() = %v", err)
 	}
-	var h http.Handler = relui.NewServer(dbPool, w, base, siteHeader, ms)
+	var prod bool // are we operating from symbolic-datum-552
+	var criaDB *criadb.AuthDatabase
 	if metadata.OnGCE() {
 		project, err := metadata.ProjectID()
 		if err != nil {
-			log.Fatal("failed to read project ID from metadata server")
+			log.Fatalln("failed to read project ID from metadata server")
 		}
-		if project == "symbolic-datum-552" {
-			h = access.RequireIAPAuthHandler(h, access.IAPSkipAudienceValidation)
+		prod = project == "symbolic-datum-552"
+		if prod {
+			criaDB, err = criadb.NewDatabase(*criaService)
+			if err != nil {
+				log.Fatalf("failed to create cria authdb: %s", err)
+			}
 		}
+	} else {
+		criaDB = criadb.NewDevDatabase()
+	}
+	var h http.Handler = relui.NewServer(dbPool, w, base, siteHeader, ms, criaDB)
+	if prod {
+		h = access.RequireIAPAuthHandler(h, access.IAPSkipAudienceValidation)
 	}
 	log.Fatalln(https.ListenAndServe(ctx, &ochttp.Handler{Handler: GRPCHandler(grpcServer, h)}))
 }

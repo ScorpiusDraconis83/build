@@ -8,6 +8,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,13 +17,10 @@ import (
 )
 
 type Target struct {
-	Name            string
-	GOOS, GOARCH    string
-	SecondClass     bool
-	Builder         string
-	BuildOnly       bool
-	LongTestBuilder string
-	ExtraEnv        []string // Extra environment variables set during toolchain build.
+	Name         string
+	GOOS, GOARCH string
+	SecondClass  bool     // A port that is not a first class port. See go.dev/wiki/PortingPolicy#first-class-ports.
+	ExtraEnv     []string // Extra environment variables set during toolchain build.
 
 	// For Darwin targets, the minimum targeted version, e.g. 10.13 or 13.
 	MinMacOSVersion string
@@ -53,90 +51,37 @@ func (rt ReleaseTargets) FirstClassPorts() map[OSArch]bool {
 	return result
 }
 
-// allReleases contains all the targets for all releases we're currently
+// allFirstClass lists first-class port targets for all releases we're currently
 // supporting. To reduce duplication, targets from earlier versions are
 // propagated forward unless overridden. To stop configuring a target in a
 // later release, set it to nil explicitly.
 // GOOS and GOARCH will be set automatically from the target name, but can be
 // overridden if necessary. Name will also be set and should not be overridden.
-var allReleases = map[int]ReleaseTargets{
-	20: {
+var allFirstClass = map[int]ReleaseTargets{
+	22: {
 		"darwin-amd64": &Target{
-			Builder:         "darwin-amd64-13",
-			MinMacOSVersion: "10.13",                                           // Issues #36025 #35459
-			ExtraEnv:        []string{"CGO_CFLAGS=-mmacosx-version-min=10.13"}, // Issues #36025 #35459
-		},
-		"darwin-arm64": &Target{
-			Builder:         "darwin-arm64-12",
-			MinMacOSVersion: "11", // Big Sur was the first release with M1 support.
-		},
-		"freebsd-386": &Target{
-			SecondClass: true,
-			Builder:     "freebsd-386-13_0",
-		},
-		"freebsd-amd64": &Target{
-			SecondClass: true,
-			Builder:     "freebsd-amd64-13_0",
-		},
-		"linux-386": &Target{
-			Builder:         "linux-386-bullseye",
-			LongTestBuilder: "linux-386-longtest",
-		},
-		"linux-armv6l": &Target{
-			GOARCH:   "arm",
-			Builder:  "linux-arm-aws",
-			ExtraEnv: []string{"GOARM=6"},
-		},
-		"linux-amd64": &Target{
-			Builder:         "linux-amd64-bullseye",
-			LongTestBuilder: "linux-amd64-longtest",
-		},
-		"linux-arm64": &Target{
-			Builder:         "linux-arm64",
-			LongTestBuilder: "linux-arm64-longtest",
-		},
-		"linux-ppc64le": &Target{
-			SecondClass: true,
-			Builder:     "linux-ppc64le-buildlet",
-			BuildOnly:   true,
-		},
-		"linux-s390x": &Target{
-			SecondClass: true,
-			Builder:     "linux-s390x-crosscompile",
-			BuildOnly:   true,
-		},
-		"windows-386": &Target{
-			Builder: "windows-386-2008",
-		},
-		"windows-amd64": &Target{
-			Builder:         "windows-amd64-2008",
-			LongTestBuilder: "windows-amd64-longtest",
-		},
-		"windows-arm64": &Target{
-			SecondClass: true,
-			Builder:     "windows-arm64-11",
-		},
-	},
-	21: {
-		"darwin-amd64": &Target{
-			Builder:         "darwin-amd64-13",
-			LongTestBuilder: "darwin-amd64-longtest",
 			MinMacOSVersion: "10.15", // go.dev/issue/57125
 		},
-		"linux-s390x":   nil,
-		"linux-ppc64le": nil,
-		"windows-386": &Target{
-			Builder: "windows-386-2016",
+		"darwin-arm64": &Target{
+			MinMacOSVersion: "11", // Big Sur was the first release with M1 support.
 		},
-		"windows-amd64": &Target{
-			Builder:         "windows-amd64-2016",
-			LongTestBuilder: "windows-amd64-longtest",
+		"linux-386": &Target{},
+		"linux-armv6l": &Target{
+			GOARCH:   "arm",
+			ExtraEnv: []string{"GOARM=6"},
 		},
-		"windows-arm": &Target{
-			Builder:     "windows-arm64-11", // Windows builds need a builder to create their MSIs.
-			SecondClass: true,
-			BuildOnly:   true,
+		"linux-amd64":   &Target{},
+		"linux-arm64":   &Target{},
+		"windows-386":   &Target{},
+		"windows-amd64": &Target{},
+	},
+	23: {
+		"darwin-amd64": &Target{
+			MinMacOSVersion: "11", // go.dev/issue/64207
 		},
+	},
+	24: {
+		// There aren't any release target changes specific to Go 1.24 at this time.
 	},
 }
 
@@ -146,7 +91,7 @@ var allPortsFS embed.FS
 var allPorts = map[int][]OSArch{}
 
 func init() {
-	for _, targets := range allReleases {
+	for _, targets := range allFirstClass {
 		for name, target := range targets {
 			if target == nil {
 				continue
@@ -190,11 +135,14 @@ func init() {
 
 func sortedReleases() []int {
 	var releases []int
-	for rel := range allReleases {
+	for rel := range allFirstClass {
+		releases = append(releases, rel)
+	}
+	for rel := range allPorts {
 		releases = append(releases, rel)
 	}
 	sort.Ints(releases)
-	return releases
+	return slices.Compact(releases)
 }
 
 var unbuildableOSs = map[string]bool{
@@ -213,30 +161,29 @@ func TargetsForGo1Point(x int) ReleaseTargets {
 		if release > x {
 			break
 		}
-		for osarch, target := range allReleases[release] {
+		for osArch, target := range allFirstClass[release] {
 			if target == nil {
-				delete(targets, osarch)
+				delete(targets, osArch)
 			} else {
 				copy := *target
-				targets[osarch] = &copy
+				targets[osArch] = &copy
 			}
 		}
 		if p, ok := allPorts[release]; ok {
 			ports = p
 		}
 	}
-	for _, osarch := range ports {
-		_, unbuildable := unbuildableOSs[osarch.OS]
-		_, exists := targets[osarch.String()]
+	for _, osArch := range ports {
+		_, unbuildable := unbuildableOSs[osArch.OS]
+		_, exists := targets[osArch.String()]
 		if unbuildable || exists {
 			continue
 		}
-		targets[osarch.String()] = &Target{
-			Name:        osarch.String(),
-			GOOS:        osarch.OS,
-			GOARCH:      osarch.Arch,
+		targets[osArch.String()] = &Target{
+			Name:        osArch.String(),
+			GOOS:        osArch.OS,
+			GOARCH:      osArch.Arch,
 			SecondClass: true,
-			BuildOnly:   true,
 		}
 	}
 	return targets

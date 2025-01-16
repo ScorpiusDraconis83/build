@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.16 && (linux || darwin)
+//go:build linux || darwin
 
 // Code related to the Build Results API.
 
@@ -25,7 +25,7 @@ import (
 
 type gRPCServer struct {
 	// embed an UnimplementedCoordinatorServer to avoid errors when adding new RPCs to the proto.
-	*protos.UnimplementedCoordinatorServer
+	protos.UnimplementedCoordinatorServer
 
 	// dashboardURL is the base URL of the Dashboard service (https://build.golang.org)
 	dashboardURL string

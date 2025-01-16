@@ -10,6 +10,8 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,25 +19,28 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/cloudbuild/apiv1/v2/cloudbuildpb"
+	"github.com/google/go-github/v48/github"
 	"github.com/google/uuid"
+	"github.com/shurcooL/githubv4"
 	pb "go.chromium.org/luci/buildbucket/proto"
-	"golang.org/x/build/buildlet"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal/gcsfs"
+	"golang.org/x/build/internal/installer/darwinpkg"
+	"golang.org/x/build/internal/installer/windowsmsi"
 	"golang.org/x/build/internal/relui/sign"
-	"golang.org/x/build/internal/untar"
 	wf "golang.org/x/build/internal/workflow"
 	"golang.org/x/exp/slices"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -87,261 +92,17 @@ func mapToTgz(files map[string]string) ([]byte, error) {
 	return w.Bytes(), nil
 }
 
-// NewFakeBuildlets creates a set of fake buildlets.
-// httpServer is the base URL of form http://host with no trailing slash
-// where PutTarFromURL downloads remote URLs from.
-// sysCmds optionally allows overriding the named system commands
-// during testing with the given executable content.
-func NewFakeBuildlets(t *testing.T, httpServer string, sysCmds map[string]string) *FakeBuildlets {
-	var sys map[string]string
-	if len(sysCmds) != 0 {
-		sys = make(map[string]string)
-		sysDir := t.TempDir()
-		for name, content := range sysCmds {
-			if err := os.WriteFile(filepath.Join(sysDir, name), []byte(content), 0700); err != nil {
-				t.Fatal(err)
-			}
-			sys[name] = filepath.Join(sysDir, name)
-		}
-	}
-	return &FakeBuildlets{
-		t:       t,
-		dir:     t.TempDir(),
-		sys:     sys,
-		httpURL: httpServer,
-		logs:    map[string][]*[]string{},
-	}
-}
-
-type FakeBuildlets struct {
-	t       *testing.T
-	dir     string
-	sys     map[string]string // System command name → absolute path.
-	httpURL string
-
-	mu     sync.Mutex
-	nextID int
-	logs   map[string][]*[]string
-}
-
-func (b *FakeBuildlets) CreateBuildlet(_ context.Context, kind string) (buildlet.RemoteClient, error) {
-	b.mu.Lock()
-	buildletDir := filepath.Join(b.dir, kind, fmt.Sprint(b.nextID), "work")
-	if err := os.MkdirAll(buildletDir, 0700); err != nil {
-		return nil, err
-	}
-	tempDir := filepath.Join(b.dir, kind, fmt.Sprint(b.nextID), "tmp")
-	if err := os.MkdirAll(tempDir, 0700); err != nil {
-		return nil, err
-	}
-	logs := &[]string{}
-	b.nextID++
-	b.logs[kind] = append(b.logs[kind], logs)
-	b.mu.Unlock()
-	logf := func(format string, args ...interface{}) {
-		line := fmt.Sprintf(format, args...)
-		line = strings.ReplaceAll(line, buildletDir, "$WORK")
-		*logs = append(*logs, line)
-	}
-	logf("--- create buildlet ---")
-
-	return &fakeBuildlet{
-		t:       b.t,
-		kind:    kind,
-		workDir: buildletDir,
-		tempDir: tempDir,
-		sys:     b.sys,
-		httpURL: b.httpURL,
-		logf:    logf,
-	}, nil
-}
-
-func (b *FakeBuildlets) DumpLogs() {
-	for name, logs := range b.logs {
-		b.t.Logf("%v buildlets:", name)
-		for _, group := range logs {
-			for _, line := range *group {
-				b.t.Log(line)
-			}
-		}
-	}
-}
-
-type fakeBuildlet struct {
-	buildlet.Client
-	t       *testing.T
-	kind    string
-	workDir string
-	tempDir string
-	sys     map[string]string // System command name → absolute path.
-	httpURL string
-	logf    func(string, ...interface{})
-	closed  bool
-}
-
-func (b *fakeBuildlet) Close() error {
-	if !b.closed {
-		b.logf("--- destroy buildlet ---")
-		b.closed = true
-	}
-	return nil
-}
-
-func (b *fakeBuildlet) Exec(ctx context.Context, cmd string, opts buildlet.ExecOpts) (remoteErr error, execErr error) {
-	// TODO: add support for opts.Path. Previously, setting opts.Path would cause
-	// an error here, but that caused unnecessary failures in tests that use mock
-	// execution.
-	if opts.OnStartExec != nil {
-		return nil, fmt.Errorf("opts.OnStartExec option is set, but fakeBuildlet doesn't support it")
-	}
-	b.logf("exec %v %v\n\twd %q env %v", cmd, opts.Args, opts.Dir, opts.ExtraEnv)
-	if absPath, ok := b.sys[cmd]; ok && opts.SystemLevel {
-		cmd = absPath
-	} else if !strings.HasPrefix(cmd, "/") && !opts.SystemLevel {
-		cmd = filepath.Join(b.workDir, cmd)
-	}
-retry:
-	c := exec.CommandContext(ctx, cmd, opts.Args...)
-	c.Env = append(os.Environ(), opts.ExtraEnv...)
-	c.Env = append(c.Env, "TEMP="+b.tempDir, "TMP="+b.tempDir, "TEMPDIR="+b.tempDir, "TMPDIR="+b.tempDir)
-	buf := &bytes.Buffer{}
-	var w io.Writer = buf
-	if opts.Output != nil {
-		w = io.MultiWriter(w, opts.Output)
-	}
-	c.Stdout = w
-	c.Stderr = w
-	if opts.Dir == "" && opts.SystemLevel {
-		c.Dir = b.workDir
-	} else if opts.Dir == "" && !opts.SystemLevel {
-		c.Dir = filepath.Dir(cmd)
-	} else {
-		c.Dir = filepath.Join(b.workDir, opts.Dir)
-	}
-	err := c.Run()
-	// Work around Unix foolishness. See go.dev/issue/22315.
-	if err != nil && strings.Contains(err.Error(), "text file busy") {
-		time.Sleep(100 * time.Millisecond)
-		goto retry
-	}
-	if err != nil {
-		return nil, fmt.Errorf("command %v %v failed: %v output: %q", cmd, opts.Args, err, buf.String())
-	}
-	return nil, nil
-}
-
-func (b *fakeBuildlet) GetTar(ctx context.Context, dir string) (io.ReadCloser, error) {
-	b.logf("get tar of %q", dir)
-	buf := &bytes.Buffer{}
-	zw := gzip.NewWriter(buf)
-	tw := tar.NewWriter(zw)
-	base := filepath.Join(b.workDir, filepath.FromSlash(dir))
-	// Copied pretty much wholesale from buildlet.go.
-	err := filepath.Walk(base, func(path string, fi os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel := strings.TrimPrefix(filepath.ToSlash(strings.TrimPrefix(path, base)), "/")
-		th, err := tar.FileInfoHeader(fi, path)
-		if err != nil {
-			return err
-		}
-		th.Name = rel
-		if fi.IsDir() && !strings.HasSuffix(th.Name, "/") {
-			th.Name += "/"
-		}
-		if th.Name == "/" {
-			return nil
-		}
-		if err := tw.WriteHeader(th); err != nil {
-			return err
-		}
-		if fi.Mode().IsRegular() {
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			if _, err := io.Copy(tw, f); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return io.NopCloser(buf), nil
-}
-
-func (b *fakeBuildlet) ListDir(ctx context.Context, dir string, opts buildlet.ListDirOpts, fn func(buildlet.DirEntry)) error {
-	// We call this when something goes wrong, so we need it to "succeed".
-	// It's not worth implementing; return some nonsense.
-	fn(buildlet.DirEntry{
-		Line: "ListDir is silently unimplemented, sorry",
-	})
-	return nil
-}
-
-func (b *fakeBuildlet) Put(ctx context.Context, r io.Reader, path string, mode os.FileMode) error {
-	b.logf("write file %q with mode %0o", path, mode)
-	if err := os.MkdirAll(filepath.Dir(filepath.Join(b.workDir, path)), 0755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(filepath.Join(b.workDir, path), os.O_CREATE|os.O_RDWR, mode)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, r); err != nil {
-		return err
-	}
-	return f.Close()
-}
-
-func (b *fakeBuildlet) PutTar(ctx context.Context, r io.Reader, dir string) error {
-	b.logf("put tar to %q", dir)
-	return untar.Untar(r, filepath.Join(b.workDir, dir))
-}
-
-func (b *fakeBuildlet) PutTarFromURL(ctx context.Context, tarURL string, dir string) error {
-	url, err := url.Parse(tarURL)
-	if err != nil {
-		return err
-	}
-	rewritten := url.String()
-	if !strings.Contains(url.Host, "localhost") && !strings.Contains(url.Host, "127.0.0.1") {
-		rewritten = b.httpURL + url.Path
-	}
-	b.logf("put tar from %v (rewritten to %v) to %q", tarURL, rewritten, dir)
-
-	resp, err := http.Get(rewritten)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status for %q: %v", tarURL, resp.Status)
-	}
-	defer resp.Body.Close()
-	return untar.Untar(resp.Body, filepath.Join(b.workDir, dir))
-}
-
-func (b *fakeBuildlet) WorkDir(ctx context.Context) (string, error) {
-	return b.workDir, nil
-}
-
 func NewFakeGerrit(t *testing.T, repos ...*FakeRepo) *FakeGerrit {
 	result := &FakeGerrit{
-		repos: map[string]*FakeRepo{},
+		repos:   make(map[string]*FakeRepo),
+		changes: make(map[string]string),
 	}
-	server := httptest.NewServer(http.HandlerFunc(result.serveHTTP))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{repo}/+archive/{archive}", result.serveArchive) // Serve a revision tarball (.tar.gz) like Gerrit does.
+	mux.HandleFunc("GET /{repo}/+/{rev}/{path...}", result.serveGitiles)
+	mux.HandleFunc("GET /{repo}/info/refs", result.serveGitInfoRefsUploadPack) // Serve a git repository over HTTP like Gerrit does.
+	mux.HandleFunc("POST /{repo}/git-upload-pack", result.serveGitUploadPack)
+	server := httptest.NewServer(mux)
 	result.serverURL = server.URL
 	t.Cleanup(server.Close)
 
@@ -352,8 +113,10 @@ func NewFakeGerrit(t *testing.T, repos ...*FakeRepo) *FakeGerrit {
 }
 
 type FakeGerrit struct {
-	repos     map[string]*FakeRepo
 	serverURL string
+	repos     map[string]*FakeRepo // Repo name → repo.
+	changesMu sync.Mutex
+	changes   map[string]string // Change ID → commit hash.
 }
 
 type FakeRepo struct {
@@ -367,10 +130,15 @@ func NewFakeRepo(t *testing.T, name string) *FakeRepo {
 		t.Skip("test requires git")
 	}
 
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, name)
+	if err := os.Mkdir(repoDir, 0700); err != nil {
+		t.Fatalf("failed to create repository directory: %s", err)
+	}
 	r := &FakeRepo{
 		t:    t,
 		name: name,
-		dir:  &GitDir{&Git{}, t.TempDir()},
+		dir:  &GitDir{&Git{}, repoDir},
 	}
 	t.Cleanup(func() { r.dir.Close() })
 	r.runGit("init")
@@ -435,6 +203,29 @@ func (repo *FakeRepo) ReadFile(commit, file string) ([]byte, error) {
 	return b, err
 }
 
+func (repo *FakeRepo) ReadDir(commit, dir string) ([]struct{ Name string }, error) {
+	b, err := repo.dir.RunCommand(context.Background(), "show", commit+":"+dir)
+	if err != nil && strings.Contains(err.Error(), " does not exist ") {
+		return nil, errors.Join(gerrit.ErrResourceNotExist, err)
+	} else if err != nil {
+		return nil, err
+	}
+	lines, ok := strings.CutPrefix(string(b), fmt.Sprintf("tree %s:%s\n\n", commit, dir))
+	if !ok {
+		return nil, fmt.Errorf("not a directory")
+	}
+	// TODO(dmitshur): After Go 1.24, consider simplifying strings.CutSuffix(…, "\n") + strings.Split(…, "\n") in favor of iterating over strings.Lines or so.
+	lines, ok = strings.CutSuffix(lines, "\n")
+	if !ok {
+		return nil, fmt.Errorf("internal error: FakeRepo.ReadDir: no trailing newline")
+	}
+	var des []struct{ Name string }
+	for _, name := range strings.Split(lines, "\n") {
+		des = append(des, struct{ Name string }{name})
+	}
+	return des, nil
+}
+
 var _ GerritClient = (*FakeGerrit)(nil)
 
 func (g *FakeGerrit) GitilesURL() string {
@@ -462,17 +253,64 @@ func (g *FakeGerrit) ReadBranchHead(ctx context.Context, project, branch string)
 	if err != nil {
 		return "", err
 	}
-	// TODO: If the branch doesn't exist, return an error matching gerrit.ErrResourceNotExist.
 	out, err := repo.dir.RunCommand(ctx, "rev-parse", "refs/heads/"+branch)
-	return strings.TrimSpace(string(out)), err
+	if err != nil {
+		// TODO(hxjiang): switch to git show-ref --exists refs/heads/branch after
+		// upgrade git to 2.43.0.
+		// https://git-scm.com/docs/git-show-ref/2.43.0#Documentation/git-show-ref.txt---exists
+		if strings.Contains(err.Error(), "unknown revision or path not in the working tree") {
+			return "", gerrit.ErrResourceNotExist
+		}
+		// Returns empty string if the error is nil to align the same behavior with
+		// the real Gerrit client.
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
-func (g *FakeGerrit) ReadFile(ctx context.Context, project string, commit string, file string) ([]byte, error) {
+func (g *FakeGerrit) ListBranches(ctx context.Context, project string) ([]gerrit.BranchInfo, error) {
+	repo, err := g.repo(project)
+	if err != nil {
+		return nil, err
+	}
+	out, err := repo.dir.RunCommand(ctx, "for-each-ref", "--format=%(refname) %(objectname:short)", "refs/heads/")
+	if err != nil {
+		return nil, err
+	}
+	var infos []gerrit.BranchInfo
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		branchCommit := strings.Fields(line)
+		infos = append(infos, gerrit.BranchInfo{Ref: branchCommit[0], Revision: branchCommit[1]})
+	}
+	return infos, nil
+}
+
+func (g *FakeGerrit) CreateBranch(ctx context.Context, project, branch string, input gerrit.BranchInput) (string, error) {
+	repo, err := g.repo(project)
+	if err != nil {
+		return "", err
+	}
+	if _, err = repo.dir.RunCommand(ctx, "branch", branch, input.Revision); err != nil {
+		return "", err
+	}
+
+	return g.ReadBranchHead(ctx, project, branch)
+}
+
+func (g *FakeGerrit) ReadFile(ctx context.Context, project, commit, file string) ([]byte, error) {
 	repo, err := g.repo(project)
 	if err != nil {
 		return nil, err
 	}
 	return repo.ReadFile(commit, file)
+}
+
+func (g *FakeGerrit) ReadDir(ctx context.Context, project, commit, dir string) ([]struct{ Name string }, error) {
+	repo, err := g.repo(project)
+	if err != nil {
+		return nil, err
+	}
+	return repo.ReadDir(commit, dir)
 }
 
 func (g *FakeGerrit) ListTags(ctx context.Context, project string) ([]string, error) {
@@ -505,11 +343,18 @@ func (g *FakeGerrit) CreateAutoSubmitChange(_ *wf.TaskContext, input gerrit.Chan
 		return "", err
 	}
 	commit := repo.CommitOnBranch(input.Branch, contents)
-	return "cl_" + commit, nil
+	g.changesMu.Lock()
+	changeID := fmt.Sprintf("%s~%d", repo.name, len(g.changes)+1)
+	g.changes[changeID] = commit
+	g.changesMu.Unlock()
+	return changeID, nil
 }
 
 func (g *FakeGerrit) Submitted(ctx context.Context, changeID, baseCommit string) (string, bool, error) {
-	return strings.TrimPrefix(changeID, "cl_"), true, nil
+	g.changesMu.Lock()
+	commit, ok := g.changes[changeID]
+	g.changesMu.Unlock()
+	return commit, ok, nil
 }
 
 func (g *FakeGerrit) Tag(ctx context.Context, project, tag, commit string) error {
@@ -551,24 +396,116 @@ func (g *FakeGerrit) GerritURL() string {
 	return g.serverURL
 }
 
-func (g *FakeGerrit) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 4 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	repo, err := g.repo(parts[1])
+func (g *FakeGerrit) serveGitInfoRefsUploadPack(w http.ResponseWriter, req *http.Request) {
+	repo, err := g.repo(req.PathValue("repo"))
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	rev := strings.TrimSuffix(parts[3], ".tar.gz")
-	archive, err := repo.dir.RunCommand(r.Context(), "archive", "--format=tgz", rev)
+	if req.URL.RawQuery != "service=git-upload-pack" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	cmd := exec.CommandContext(req.Context(), "git", "upload-pack", "--strict", "--advertise-refs", ".")
+	cmd.Dir = filepath.Join(repo.dir.dir, ".git")
+	cmd.Env = append(os.Environ(), "GIT_PROTOCOL="+req.Header.Get("Git-Protocol"))
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	err = cmd.Run()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	io.WriteString(w, "001e# service=git-upload-pack\n0000")
+	io.Copy(w, &buf)
+}
+func (g *FakeGerrit) serveGitUploadPack(w http.ResponseWriter, req *http.Request) {
+	repo, err := g.repo(req.PathValue("repo"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if req.Header.Get("Content-Type") != "application/x-git-upload-pack-request" {
+		http.Error(w, "unexpected Content-Type", http.StatusBadRequest)
+		return
+	}
+	cmd := exec.CommandContext(req.Context(), "git", "upload-pack", "--strict", "--stateless-rpc", ".")
+	cmd.Dir = filepath.Join(repo.dir.dir, ".git")
+	cmd.Env = append(os.Environ(), "GIT_PROTOCOL="+req.Header.Get("Git-Protocol"))
+	cmd.Stdin = req.Body
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	err = cmd.Run()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	io.Copy(w, &buf)
+}
+
+func (g *FakeGerrit) serveArchive(w http.ResponseWriter, req *http.Request) {
+	repo, err := g.repo(req.PathValue("repo"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	rev, ok := strings.CutSuffix(req.PathValue("archive"), ".tar.gz")
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	archive, err := repo.dir.RunCommand(req.Context(), "archive", "--format=tgz", rev)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	http.ServeContent(w, r, parts[3], time.Now(), bytes.NewReader(archive))
+	http.ServeContent(w, req, req.PathValue("archive"), time.Now(), bytes.NewReader(archive))
+}
+
+func (g *FakeGerrit) serveGitiles(w http.ResponseWriter, req *http.Request) {
+	repo, err := g.repo(req.PathValue("repo"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	rev, path := req.PathValue("rev"), req.PathValue("path")
+	switch req.URL.Query().Get("format") {
+	case "JSON":
+		des, err := repo.ReadDir(rev, path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, ")]}'\n") // Magic prefix.
+		var v struct {
+			ID      string `json:"id"`
+			Entries []struct {
+				Name string `json:"name"`
+			}
+		}
+		v.ID = rev
+		for _, de := range des {
+			v.Entries = append(v.Entries, struct {
+				Name string `json:"name"`
+			}(de))
+		}
+		json.NewEncoder(w).Encode(v)
+	case "TEXT":
+		b, err := repo.ReadFile(rev, path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		enc := base64.NewEncoder(base64.StdEncoding, w)
+		enc.Write(b)
+		enc.Close()
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
 }
 
 func (*FakeGerrit) QueryChanges(_ context.Context, query string) ([]*gerrit.ChangeInfo, error) {
@@ -577,6 +514,10 @@ func (*FakeGerrit) QueryChanges(_ context.Context, query string) ([]*gerrit.Chan
 
 func (*FakeGerrit) SetHashtags(_ context.Context, changeID string, _ gerrit.HashtagsInput) error {
 	return fmt.Errorf("pretend that SetHashtags failed")
+}
+
+func (*FakeGerrit) GetChange(_ context.Context, _ string, _ ...gerrit.QueryChangesOpt) (*gerrit.ChangeInfo, error) {
+	return nil, nil
 }
 
 // NewFakeSignService returns a fake signing service that can sign PKGs, MSIs,
@@ -603,6 +544,17 @@ func (s *FakeSignService) SignArtifact(_ context.Context, bt sign.BuildType, in 
 	jobID = uuid.NewString()
 	var out []string
 	switch bt {
+	case sign.BuildMacOSConstructInstallerOnly:
+		if len(in) != 2 {
+			return "", fmt.Errorf("got %d inputs, want 2", len(in))
+		}
+		out = []string{s.fakeConstructPKG(jobID, in[0], in[1], fmt.Sprintf("-installer <%s>", bt))}
+	case sign.BuildWindowsConstructInstallerOnly:
+		if len(in) != 2 {
+			return "", fmt.Errorf("got %d inputs, want 2", len(in))
+		}
+		out = []string{s.fakeConstructMSI(jobID, in[0], in[1], fmt.Sprintf("-installer <%s>", bt))}
+
 	case sign.BuildMacOS:
 		if len(in) != 1 {
 			return "", fmt.Errorf("got %d inputs, want 1", len(in))
@@ -644,12 +596,78 @@ func (s *FakeSignService) CancelSigning(_ context.Context, jobID string) error {
 	return fmt.Errorf("intentional fake error")
 }
 
+func (s *FakeSignService) fakeConstructPKG(jobID, f, meta, msg string) string {
+	// Check installer metadata.
+	b, err := os.ReadFile(strings.TrimPrefix(meta, "file://"))
+	if err != nil {
+		panic(fmt.Errorf("fakeConstructPKG: os.ReadFile: %v", err))
+	}
+	var opt darwinpkg.InstallerOptions
+	if err := json.Unmarshal(b, &opt); err != nil {
+		panic(fmt.Errorf("fakeConstructPKG: json.Unmarshal: %v", err))
+	}
+	var errs []error
+	switch opt.GOARCH {
+	case "amd64", "arm64": // OK.
+	default:
+		errs = append(errs, fmt.Errorf("unexpected GOARCH value: %q", opt.GOARCH))
+	}
+	switch min, _ := strconv.Atoi(opt.MinMacOSVersion); {
+	case min >= 11: // macOS 11 or greater; OK.
+	case opt.MinMacOSVersion == "10.15": // OK.
+	case opt.MinMacOSVersion == "10.13": // OK. Go 1.20 has macOS 10.13 as its minimum.
+	default:
+		errs = append(errs, fmt.Errorf("unexpected MinMacOSVersion value: %q", opt.MinMacOSVersion))
+	}
+	if err := errors.Join(errs...); err != nil {
+		panic(fmt.Errorf("fakeConstructPKG: unexpected installer options %#v: %v", opt, err))
+	}
+
+	// Construct fake installer.
+	b, err = os.ReadFile(strings.TrimPrefix(f, "file://"))
+	if err != nil {
+		panic(fmt.Errorf("fakeConstructPKG: os.ReadFile: %v", err))
+	}
+	return s.writeOutput(jobID, path.Base(f)+".pkg", append([]byte("I'm a PKG!\n"), b...))
+}
+
+func (s *FakeSignService) fakeConstructMSI(jobID, f, meta, msg string) string {
+	// Check installer metadata.
+	b, err := os.ReadFile(strings.TrimPrefix(meta, "file://"))
+	if err != nil {
+		panic(fmt.Errorf("fakeConstructMSI: os.ReadFile: %v", err))
+	}
+	var opt windowsmsi.InstallerOptions
+	if err := json.Unmarshal(b, &opt); err != nil {
+		panic(fmt.Errorf("fakeConstructMSI: json.Unmarshal: %v", err))
+	}
+	var errs []error
+	switch opt.GOARCH {
+	case "386", "amd64", "arm", "arm64": // OK.
+	default:
+		errs = append(errs, fmt.Errorf("unexpected GOARCH value: %q", opt.GOARCH))
+	}
+	if err := errors.Join(errs...); err != nil {
+		panic(fmt.Errorf("fakeConstructMSI: unexpected installer options %#v: %v", opt, err))
+	}
+
+	// Construct fake installer.
+	_, err = os.ReadFile(strings.TrimPrefix(f, "file://"))
+	if err != nil {
+		panic(fmt.Errorf("fakeConstructMSI: os.ReadFile: %v", err))
+	}
+	return s.writeOutput(jobID, path.Base(f)+".msi", []byte("I'm an MSI!\n"))
+}
+
 func (s *FakeSignService) fakeSignPKG(jobID, f, msg string) string {
 	b, err := os.ReadFile(strings.TrimPrefix(f, "file://"))
 	if err != nil {
 		panic(fmt.Errorf("fakeSignPKG: os.ReadFile: %v", err))
 	}
-	b = bytes.TrimPrefix(b, []byte("I'm a PKG!\n"))
+	b, ok := bytes.CutPrefix(b, []byte("I'm a PKG!\n"))
+	if !ok {
+		panic(fmt.Errorf("fakeSignPKG: input doesn't look like a PKG to be signed"))
+	}
 	files, err := tgzToMap(bytes.NewReader(b))
 	if err != nil {
 		panic(fmt.Errorf("fakeSignPKG: tgzToMap: %v", err))
@@ -741,6 +759,8 @@ case "$1" in
   if [[ $out == '-' ]]; then
     out=/dev/stdout
   fi
+  dir=$(dirname "$out")
+  mkdir -p "${dir#file://}"
   cp "${in#file://}" "${out#file://}"
   ;;
 "cat")
@@ -753,13 +773,29 @@ case "$1" in
 esac
 `
 
-func NewFakeCloudBuild(t *testing.T, gerrit *FakeGerrit, project string, allowedTriggers map[string]map[string]string, fakeGo string) *FakeCloudBuild {
+const fakeEmptyBinary = `
+#!/bin/bash -eux
+echo "this binary will always exit without any error"
+exit 0
+`
+
+type FakeBinary struct {
+	Name string
+	// Implementation defines the script content. This script is written to the
+	// tool directory and executed when the corresponding command is invoked.
+	Implementation string
+}
+
+func NewFakeCloudBuild(t *testing.T, gerrit *FakeGerrit, project string, allowedTriggers map[string]map[string]string, fakeBinaries ...FakeBinary) *FakeCloudBuild {
 	toolDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(toolDir, "go"), []byte(fakeGo), 0777); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(filepath.Join(toolDir, "gsutil"), []byte(fakeGsutil), 0777); err != nil {
 		t.Fatal(err)
+	}
+
+	for _, binary := range fakeBinaries {
+		if err := os.WriteFile(filepath.Join(toolDir, binary.Name), []byte(binary.Implementation), 0777); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return &FakeCloudBuild{
 		t:               t,
@@ -862,6 +898,76 @@ func (cb *FakeCloudBuild) RunScript(ctx context.Context, script string, gerritPr
 	cb.results[id] = runErr
 	cb.mu.Unlock()
 	return CloudBuild{Project: cb.project, ID: id, ResultURL: "file://" + resultDir}, nil
+}
+
+func (cb *FakeCloudBuild) RunCustomSteps(ctx context.Context, steps func(resultURL string) []*cloudbuildpb.BuildStep, _ *CloudBuildOptions) (CloudBuild, error) {
+	var gerritProject, fullScript string
+	resultURL := "file://" + cb.t.TempDir()
+	for i, step := range steps(resultURL) {
+		// Cloud Build support docker hub images like "bash". See more details:
+		// https://cloud.google.com/build/docs/interacting-with-dockerhub-images
+		// Currently, the Bash script is solely for downloading binaries like go.
+		// The binaries are included when calling NewFakeCloudBuild() , allowing
+		// us to bypass the Bash script for now.
+		if step.Name == "bash" {
+			continue
+		}
+		tool, found := strings.CutPrefix(step.Name, "gcr.io/cloud-builders/")
+		if !found {
+			return CloudBuild{}, fmt.Errorf("does not support custom image: %s", step.Name)
+		}
+		if tool == "git" && len(step.Args) > 0 && step.Args[0] == "clone" {
+			for _, arg := range step.Args {
+				project, found := strings.CutPrefix(arg, "https://go.googlesource.com/")
+				if found {
+					gerritProject = project
+					break
+				}
+			}
+			continue
+		}
+
+		// As documented by the cloudbuildpb.BuildStep, when the script field is
+		// provided, the user cannot specify the entrypoint or args.
+		if step.Script != "" && len(step.Args) > 0 {
+			return CloudBuild{}, fmt.Errorf("step[%v] can not have script and arguments", i)
+		}
+		if step.Script != "" && step.Entrypoint != "" {
+			return CloudBuild{}, fmt.Errorf("step[%v] can not have script and entrypoint", i)
+		}
+
+		// RunCustomSteps allows execution of commands or scripts in any directory,
+		// while RunScript always executes in the repo's root directory.
+		// To use RunScript within RunCustomSteps, we must first navigate to the
+		// target directory if it differs from the repo root.
+		if relative := strings.TrimPrefix(step.Dir, gerritProject+"/"); step.Dir != gerritProject && relative != "" {
+			fullScript += "pushd " + relative + "\n"
+		}
+
+		if len(step.Args) > 0 {
+			fullScript += tool + " " + strings.Join(step.Args, " ") + "\n"
+		}
+		if step.Script != "" {
+			fullScript += step.Script + "\n"
+		}
+
+		// Return to the previous dir after finish the commands or scripts execution.
+		if relative := strings.TrimPrefix(step.Dir, gerritProject+"/"); step.Dir != gerritProject && relative != "" {
+			fullScript += "popd\n"
+		}
+	}
+
+	// In real CloudBuild client, the RunScript calls this lower level method.
+	build, err := cb.RunScript(ctx, fullScript, gerritProject, nil)
+	if err != nil {
+		return CloudBuild{}, err
+	}
+	// Overwrites the ResultURL as the actual output is written to a unique result
+	// directory generated by this method.
+	// Unit tests should verify the contents of this directory.
+	// The ResultURL returned by RunScript is not used for output and will always
+	// point to a new, empty directory.
+	return CloudBuild{ID: build.ID, Project: build.Project, ResultURL: resultURL}, nil
 }
 
 type FakeSwarmingClient struct {
@@ -1014,4 +1120,130 @@ func (c *FakeBuildBucketClient) SearchBuilds(ctx context.Context, pred *pb.Build
 		return nil, nil
 	}
 	return []int64{rand.Int63()}, nil
+}
+
+type FakeGitHub struct {
+	// Milestones is a map from milestone ID to milestone name.
+	Milestones map[int]string
+	// Issues is a map from issue number to issue details.
+	// this map contains all the Issues attached to all milestones and Issues that
+	// does not attach to milestone.
+	Issues map[int]*github.Issue
+
+	// The following fields modify behavior of the fake to test
+	// certain special scenarios.
+
+	DisallowComments bool // if set, return an error from PostComment
+	lastIssueNumber  int  // last issue number created by nextIssueNumber, or 0
+	lastMilestoneID  int  // last milestone ID created by nextMilestoneID, or 0
+}
+
+func (f *FakeGitHub) nextMilestoneID() int {
+	for {
+		f.lastMilestoneID++
+		if _, ok := f.Milestones[f.lastMilestoneID]; !ok {
+			return f.lastMilestoneID
+		}
+	}
+}
+
+func (f *FakeGitHub) nextIssueNumber() int {
+	for {
+		f.lastIssueNumber++
+		if _, ok := f.Issues[f.lastIssueNumber]; !ok {
+			return f.lastIssueNumber
+		}
+	}
+}
+
+func (f *FakeGitHub) FetchMilestone(_ context.Context, owner, repo, name string, create bool) (int, error) {
+	for id, n := range f.Milestones {
+		if n == name {
+			return id, nil
+		}
+	}
+
+	if create {
+		newID := f.nextMilestoneID()
+		if f.Milestones == nil {
+			f.Milestones = map[int]string{}
+		}
+		f.Milestones[newID] = name
+		return newID, nil
+	}
+	return 0, fmt.Errorf("milestone %q not found and create parameter is false", name)
+}
+
+func (f *FakeGitHub) FetchMilestoneIssues(_ context.Context, owner, repo string, milestoneID int) (map[int]map[string]bool, error) {
+	if _, ok := f.Milestones[milestoneID]; !ok {
+		return nil, fmt.Errorf("milestone %v not found", milestoneID)
+	}
+	issueLabels := map[int]map[string]bool{}
+	for number, issue := range f.Issues {
+		if issue.Milestone == nil {
+			continue
+		}
+
+		if *issue.Milestone.ID != int64(milestoneID) {
+			continue
+		}
+
+		issueLabels[number] = map[string]bool{}
+		for _, label := range issue.Labels {
+			issueLabels[number][*label.Name] = true
+		}
+	}
+	return issueLabels, nil
+}
+
+func (*FakeGitHub) UploadReleaseAsset(ctx context.Context, owner, repo string, releaseID int64, fileName string, file fs.File) (*github.ReleaseAsset, error) {
+	return nil, nil
+}
+
+func (*FakeGitHub) CreateRelease(ctx context.Context, owner, repo string, release *github.RepositoryRelease) (*github.RepositoryRelease, error) {
+	return nil, nil
+}
+
+func (*FakeGitHub) EditIssue(_ context.Context, owner, repo string, number int, issue *github.IssueRequest) (*github.Issue, *github.Response, error) {
+	return nil, nil, nil
+}
+
+func (f *FakeGitHub) CreateIssue(ctx context.Context, owner, repo string, request *github.IssueRequest) (*github.Issue, *github.Response, error) {
+	if f.Issues == nil {
+		f.Issues = map[int]*github.Issue{}
+	}
+
+	issueNumber := f.nextIssueNumber()
+	f.Issues[issueNumber] = &github.Issue{Number: &issueNumber, Title: request.Title, Body: request.Body}
+	if request.Labels != nil {
+		for _, l := range *request.Labels {
+			f.Issues[issueNumber].Labels = append(f.Issues[issueNumber].Labels, &github.Label{Name: &l})
+		}
+	}
+	if request.Milestone != nil {
+		if _, ok := f.Milestones[*request.Milestone]; !ok {
+			return nil, nil, fmt.Errorf("the milestone does not exist: %v", *request.Milestone)
+		}
+		f.Issues[issueNumber].Milestone = &github.Milestone{ID: github.Int64(int64(*request.Milestone))}
+	}
+	return f.GetIssue(ctx, owner, repo, issueNumber)
+}
+
+func (f *FakeGitHub) GetIssue(_ context.Context, owner, repo string, number int) (*github.Issue, *github.Response, error) {
+	if issue, ok := f.Issues[number]; !ok {
+		return nil, nil, fmt.Errorf("the issue %v does not exist", number)
+	} else {
+		return issue, nil, nil
+	}
+}
+
+func (*FakeGitHub) EditMilestone(_ context.Context, owner, repo string, number int, milestone *github.Milestone) (*github.Milestone, *github.Response, error) {
+	return nil, nil, nil
+}
+
+func (f *FakeGitHub) PostComment(_ context.Context, _ githubv4.ID, _ string) error {
+	if f.DisallowComments {
+		return fmt.Errorf("pretend that PostComment failed")
+	}
+	return nil
 }

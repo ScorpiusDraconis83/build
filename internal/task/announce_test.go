@@ -104,9 +104,9 @@ This is CVE-2022-27536 and https://go.dev/issue/51759.`,
 			name: "announce-rc",
 			in: releaseAnnouncement{
 				Kind:    KindRC,
-				Version: "go1.19rc6",
+				Version: "go1.23rc1",
 			},
-			wantSubject: "Go 1.19 Release Candidate 6 is released",
+			wantSubject: "Go 1.23 Release Candidate 1 is released",
 		},
 		{
 			name: "announce-major",
@@ -139,6 +139,51 @@ This is CVE-2022-27536 and https://go.dev/issue/51759.`,
 				Names:    []string{"Alice", "Bob"},
 			},
 			wantSubject: "[security] Go 1.18.4 pre-announcement",
+		},
+		{
+			name: "gopls-pre-announce",
+			in: goplsPrereleaseAnnouncement{
+				Version: "v0.16.2-pre.1",
+				Branch:  "gopls-release-branch.0.16",
+				Commit:  "abc123def456ghi789",
+				Issue:   12345,
+			},
+			wantSubject: "Gopls v0.16.2-pre.1 is released",
+		},
+		{
+			name: "gopls-announce",
+			in: goplsReleaseAnnouncement{
+				Version: "v0.16.2",
+				Branch:  "gopls-release-branch.0.16",
+				Commit:  "abc123def456ghi789",
+			},
+			wantSubject: "Gopls v0.16.2 is released",
+		},
+		{
+			name: "vscode-go-announce",
+			in: vscodeGoReleaseAnnouncement{
+				Version: "v0.44.2",
+			},
+			wantSubject: "VSCode-Go extension v0.44.2 is released",
+		},
+		{
+			name: "vscode-go-pre-announce",
+			in: vscodeGoPrereleaseAnnouncement{
+				Version: "v0.44.2-rc.1",
+				Branch:  "release-v0.44",
+				Commit:  "abc123def456ghi789",
+				Issue:   12345,
+			},
+			wantSubject: "VSCode-Go extension v0.44.2-rc.1 is released",
+		},
+		{
+			name: "vscode-go-insider-announce",
+			in: vscodeGoInsiderAnnouncement{
+				Version:       "v0.43.2",
+				Commit:        "abc123def456ghi789",
+				StableVersion: "v0.44.0",
+			},
+			wantSubject: "VSCode-Go extension v0.43.2 is released",
 		},
 	}
 	for _, tc := range tests {
@@ -401,6 +446,20 @@ There may be security fixes following the [security policy](https://go.dev/secur
 
 	Some description of the problem here.
 
+		Regular Code Block
+		Can
+		Be
+		Here
+
+	Another paragraph.
+
+	` + "```" + `
+	Fenced Code Block
+	Can
+	Be
+	Here
+	` + "```" + `
+
 	Markdown allows one to use backslash escapes, like \_underscore\_
 	or \*literal asterisks\*, so we might encounter that.
 
@@ -415,8 +474,11 @@ To builds from source, use
 
 An easy way to try go1.19beta1
 is by using the go command:
+
+` + "```" + `
 $ go install example.org@latest
 $ example download
+` + "```" + `
 
 That's all for now.
 `
@@ -445,6 +507,18 @@ There may be security fixes following the security policy <https://go.dev/securi
 
 	Some description of the problem here.
 
+	Regular Code Block
+	Can
+	Be
+	Here
+
+	Another paragraph.
+
+	Fenced Code Block
+	Can
+	Be
+	Here
+
 	Markdown allows one to use backslash escapes, like \_underscore\_
 	or \*literal asterisks\*, so we might encounter that.
 
@@ -459,6 +533,7 @@ git checkout.
 
 An easy way to try go1.19beta1
 is by using the go command:
+
 $ go install example.org@latest
 $ example download
 

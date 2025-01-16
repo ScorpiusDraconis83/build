@@ -330,6 +330,7 @@ func main() {
 			{goRepo, 40593}: true,
 			{goRepo, 40600}: true,
 			{goRepo, 41211}: true,
+			{goRepo, 41268}: true, // transferred to https://github.com/golang/tour/issues/1042
 			{goRepo, 41336}: true,
 			{goRepo, 41649}: true,
 			{goRepo, 41650}: true,
@@ -364,7 +365,9 @@ func main() {
 			{goRepo, 45082}: true,
 			{goRepo, 45201}: true,
 			{goRepo, 45202}: true,
-			{goRepo, 47141}: true,
+			{goRepo, 47140}: true,
+			{goRepo, 62987}: true,
+			{goRepo, 67913}: true,
 
 			{vscode, 298}:  true,
 			{vscode, 524}:  true,
@@ -373,6 +376,9 @@ func main() {
 			{vscode, 773}:  true,
 			{vscode, 959}:  true,
 			{vscode, 1402}: true,
+			{vscode, 2260}: true, // transferred to https://go.dev/issue/53080
+			{vscode, 2548}: true,
+			{vscode, 2781}: true, // transferred to https://go.dev/issue/60435
 		},
 	}
 	for n := int32(55359); n <= 55828; n++ {
@@ -448,6 +454,7 @@ var tasks = []struct {
 }{
 	// Tasks that are specific to the golang/go repo.
 	{"kicktrain", (*gopherbot).getOffKickTrain},
+	{"label access issues", (*gopherbot).labelAccessIssues},
 	{"label build issues", (*gopherbot).labelBuildIssues},
 	{"label compiler/runtime issues", (*gopherbot).labelCompilerRuntimeIssues},
 	{"label mobile issues", (*gopherbot).labelMobileIssues},
@@ -461,6 +468,7 @@ var tasks = []struct {
 	{"handle telemetry issues", (*gopherbot).handleTelemetryIssues},
 	{"open cherry pick issues", (*gopherbot).openCherryPickIssues},
 	{"close cherry pick issues", (*gopherbot).closeCherryPickIssues},
+	{"close luci-config issues", (*gopherbot).closeLUCIConfigIssues},
 	{"set subrepo milestones", (*gopherbot).setSubrepoMilestones},
 	{"set misc milestones", (*gopherbot).setMiscMilestones},
 	{"apply minor release milestones", (*gopherbot).setMinorMilestones},
@@ -484,6 +492,7 @@ var tasks = []struct {
 	{"cl2issue", (*gopherbot).cl2issue},
 	{"congratulate new contributors", (*gopherbot).congratulateNewContributors},
 	{"un-wait CLs", (*gopherbot).unwaitCLs},
+	{"convert wait-release topic to hashtag", (*gopherbot).topicToHashtag},
 }
 
 // gardenIssues reports whether GopherBot should perform general issue
@@ -493,7 +502,7 @@ func gardenIssues(repo *maintner.GitHubRepo) bool {
 		return false
 	}
 	switch repo.ID().Repo {
-	case "go", "vscode-go", "vulndb":
+	case "go", "vscode-go", "vulndb", "oscar":
 		return true
 	}
 	return false
@@ -533,9 +542,9 @@ func (b *gopherbot) doTasks(ctx context.Context) []error {
 
 // issuesService represents portions of github.IssuesService that we want to override in tests.
 type issuesService interface {
-	ListLabelsByIssue(ctx context.Context, owner string, repo string, number int, opt *github.ListOptions) ([]*github.Label, *github.Response, error)
-	AddLabelsToIssue(ctx context.Context, owner string, repo string, number int, labels []string) ([]*github.Label, *github.Response, error)
-	RemoveLabelForIssue(ctx context.Context, owner string, repo string, number int, label string) (*github.Response, error)
+	ListLabelsByIssue(ctx context.Context, owner, repo string, number int, opt *github.ListOptions) ([]*github.Label, *github.Response, error)
+	AddLabelsToIssue(ctx context.Context, owner, repo string, number int, labels []string) ([]*github.Label, *github.Response, error)
+	RemoveLabelForIssue(ctx context.Context, owner, repo string, number int, label string) (*github.Response, error)
 }
 
 func (b *gopherbot) addLabel(ctx context.Context, repoID maintner.GitHubRepoID, gi *maintner.GitHubIssue, label string) error {
@@ -637,9 +646,15 @@ func (b *gopherbot) setMilestone(ctx context.Context, repoID maintner.GitHubRepo
 	if *dryRun {
 		return nil
 	}
-	_, _, err := b.ghc.Issues.Edit(ctx, repoID.Owner, repoID.Repo, int(gi.Number), &github.IssueRequest{
+	_, resp, err := b.ghc.Issues.Edit(ctx, repoID.Owner, repoID.Repo, int(gi.Number), &github.IssueRequest{
 		Milestone: github.Int(m.Number),
 	})
+	if err != nil && resp != nil && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone) {
+		// An issue can become gone on GitHub without maintner realizing it. See go.dev/issue/30184.
+		log.Printf("setMilestone: Issue %v#%v returned %s when trying to set milestone. Skipping. See go.dev/issue/30184.", repoID, gi.Number, resp.Status)
+		b.deletedIssues[githubIssue{repoID, gi.Number}] = true
+		return nil
+	}
 	return err
 }
 
@@ -952,15 +967,15 @@ func (b *gopherbot) labelProposals(ctx context.Context) error {
 		if !strings.HasPrefix(gi.Title, "proposal:") && !strings.HasPrefix(gi.Title, "Proposal:") {
 			return nil
 		}
-		// Add Milestone if missing:
-		if gi.Milestone.IsNone() && !gi.HasEvent("milestoned") && !gi.HasEvent("demilestoned") {
-			if err := b.setMilestone(ctx, b.gorepo.ID(), gi, proposal); err != nil {
-				return err
-			}
-		}
 		// Add Proposal label if missing:
 		if !gi.HasLabel("Proposal") && !gi.HasEvent("unlabeled") {
 			if err := b.addLabel(ctx, b.gorepo.ID(), gi, "Proposal"); err != nil {
+				return err
+			}
+		}
+		// Add Milestone if missing:
+		if gi.Milestone.IsNone() && !gi.HasEvent("milestoned") && !gi.HasEvent("demilestoned") {
+			if err := b.setMilestone(ctx, b.gorepo.ID(), gi, proposal); err != nil {
 				return err
 			}
 		}
@@ -1077,6 +1092,15 @@ func (b *gopherbot) setVSCodeGoMilestones(ctx context.Context) error {
 			return nil
 		}
 		return b.setMilestone(ctx, vscode.ID(), gi, vscodeUntriaged)
+	})
+}
+
+func (b *gopherbot) labelAccessIssues(ctx context.Context) error {
+	return b.foreachIssue(b.gorepo, open, func(gi *maintner.GitHubIssue) error {
+		if !strings.HasPrefix(gi.Title, "access: ") || gi.HasLabel("Access") || gi.HasEvent("unlabeled") {
+			return nil
+		}
+		return b.addLabel(ctx, b.gorepo.ID(), gi, "Access")
 	})
 }
 
@@ -1617,6 +1641,31 @@ func (b *gopherbot) unwaitCLs(ctx context.Context) error {
 	})
 }
 
+// topicToHashtag converts CLs with 'wait-release' topic
+// to the likely intended uses of 'wait-release' hashtag.
+func (b *gopherbot) topicToHashtag(ctx context.Context) error {
+	waitTopicCLs, err := b.gerrit.QueryChanges(ctx, "status:open topic:wait-release")
+	if err != nil {
+		return err
+	}
+	for _, cl := range waitTopicCLs {
+		if *dryRun {
+			log.Printf("[dry run] would replace 'wait-release' topic with hashtag on CL %d (%.32s…)", cl.ChangeNumber, cl.Subject)
+			continue
+		}
+		_, err := b.gerrit.AddHashtags(ctx, cl.ID, "wait-release")
+		if err != nil {
+			return err
+		}
+		err = b.gerrit.DeleteTopic(ctx, cl.ID)
+		if err != nil {
+			return err
+		}
+		log.Printf("https://go.dev/cl/%d: replaced 'wait-release' topic with hashtag", cl.ChangeNumber)
+	}
+	return nil
+}
+
 // onLatestCL checks whether cl's metadata is up to date with Gerrit's
 // upstream data and, if so, returns f(). If it's out of date, it does
 // nothing more and returns nil.
@@ -1811,7 +1860,7 @@ func (b *gopherbot) setMinorMilestones(ctx context.Context) error {
 }
 
 // closeCherryPickIssues closes cherry-pick issues when CLs are merged to
-// release branches, as GitHub only does that on merge to master.
+// release branches, as GitHub only does that on merge to the main branch.
 func (b *gopherbot) closeCherryPickIssues(ctx context.Context) error {
 	cherryPickIssues := make(map[int32]*maintner.GitHubIssue) // by GitHub Issue Number
 	b.foreachIssue(b.gorepo, open, func(gi *maintner.GitHubIssue) error {
@@ -1854,13 +1903,50 @@ func (b *gopherbot) closeCherryPickIssues(ctx context.Context) error {
 				}
 				printIssue("close-cherry-pick", ref.Repo.ID(), gi)
 				if err := b.addGitHubComment(ctx, ref.Repo, gi.Number, fmt.Sprintf(
-					"Closed by merging %s to %s.", cl.Commit.Hash, cl.Branch())); err != nil {
+					"Closed by merging [CL %d](https://go.dev/cl/%d) (commit %s) to `%s`.", cl.Number, cl.Number, cl.Commit.Hash, cl.Branch())); err != nil {
 					return err
 				}
 				return b.closeGitHubIssue(ctx, ref.Repo.ID(), gi.Number, completed)
 			}
 			return nil
 		})
+	})
+}
+
+// closeLUCIConfigIssues closes specified issues when CLs are merged to the
+// luci-config branch, as GitHub only does that on merge to the main branch.
+func (b *gopherbot) closeLUCIConfigIssues(ctx context.Context) error {
+	buildProject := b.corpus.Gerrit().Project("go.googlesource.com", "build")
+	if buildProject == nil {
+		return fmt.Errorf("no go.googlesource.com/build Gerrit project in corpus")
+	}
+	monthAgo := time.Now().Add(-30 * 24 * time.Hour)
+	return buildProject.ForeachCLUnsorted(func(cl *maintner.GerritCL) error {
+		if cl.Commit.CommitTime.Before(monthAgo) {
+			// If the CL was last updated over a month ago, assume (as an
+			// optimization) that gopherbot already processed this CL.
+			return nil
+		}
+		if cl.Status != "merged" || cl.Private || cl.Branch() != "luci-config" {
+			return nil
+		}
+		for _, ref := range cl.GitHubIssueRefs {
+			if ref.Repo != b.gorepo {
+				continue
+			}
+			gi := b.gorepo.Issue(ref.Number)
+			if gi == nil || gi.NotExist || gi.PullRequest || gi.Locked || b.deletedIssues[githubIssue{ref.Repo.ID(), gi.Number}] ||
+				gi.Closed || gi.HasEvent("reopened") || !strings.Contains(cl.Commit.Msg, fmt.Sprintf("\nFixes golang/go#%d", gi.Number)) {
+				continue
+			}
+			printIssue("close luci-config issues", ref.Repo.ID(), gi)
+			if err := b.addGitHubComment(ctx, ref.Repo, gi.Number, fmt.Sprintf(
+				"Closed by merging [CL %d](https://go.dev/cl/%d) (commit golang/%s@%s) to `%s`.", cl.Number, cl.Number, cl.Project.Project(), cl.Commit.Hash, cl.Branch())); err != nil {
+				return err
+			}
+			return b.closeGitHubIssue(ctx, ref.Repo.ID(), gi.Number, completed)
+		}
+		return nil
 	})
 }
 
@@ -2072,7 +2158,7 @@ func labelChangeDisallowed(label, action string) bool {
 // assignReviewersOptOut lists contributors who have opted out from
 // having reviewers automatically added to their CLs.
 var assignReviewersOptOut = map[string]bool{
-	"mdempsky@google.com": true,
+	"matthew@go.dev": true,
 }
 
 // assignReviewersToCLs looks for CLs with no humans in the reviewer or CC fields
@@ -2081,11 +2167,11 @@ var assignReviewersOptOut = map[string]bool{
 // using the go.dev/s/owners API.
 func (b *gopherbot) assignReviewersToCLs(ctx context.Context) error {
 	const tagNoOwners = "no-owners"
-	b.corpus.Gerrit().ForeachProjectUnsorted(func(gp *maintner.GerritProject) error {
+	return b.corpus.Gerrit().ForeachProjectUnsorted(func(gp *maintner.GerritProject) error {
 		if gp.Project() == "scratch" || gp.Server() != "go.googlesource.com" {
 			return nil
 		}
-		gp.ForeachOpenCL(func(cl *maintner.GerritCL) error {
+		return gp.ForeachOpenCL(func(cl *maintner.GerritCL) error {
 			if cl.Private || cl.WorkInProgress() || time.Since(cl.Created) < 10*time.Minute {
 				return nil
 			}
@@ -2187,9 +2273,7 @@ func (b *gopherbot) assignReviewersToCLs(ctx context.Context) error {
 			}
 			return nil
 		})
-		return nil
 	})
-	return nil
 }
 
 func sameReviewers(reviewers []string, review gerrit.ReviewInput) bool {
@@ -2226,26 +2310,25 @@ outer:
 
 // abandonScratchReviews abandons Gerrit CLs in the "scratch" project if they've been open for over a week.
 func (b *gopherbot) abandonScratchReviews(ctx context.Context) error {
+	scratchProject := b.corpus.Gerrit().Project("go.googlesource.com", "scratch")
+	if scratchProject == nil {
+		return fmt.Errorf("no go.googlesource.com/scratch Gerrit project in corpus")
+	}
 	tooOld := time.Now().Add(-24 * time.Hour * 7)
-	return b.corpus.Gerrit().ForeachProjectUnsorted(func(gp *maintner.GerritProject) error {
-		if gp.Project() != "scratch" || gp.Server() != "go.googlesource.com" {
+	return scratchProject.ForeachOpenCL(func(cl *maintner.GerritCL) error {
+		if b.deletedChanges[gerritChange{scratchProject.Project(), cl.Number}] || !cl.Meta.Commit.CommitTime.Before(tooOld) {
 			return nil
 		}
-		return gp.ForeachOpenCL(func(cl *maintner.GerritCL) error {
-			if b.deletedChanges[gerritChange{gp.Project(), cl.Number}] || !cl.Meta.Commit.CommitTime.Before(tooOld) {
-				return nil
-			}
-			if *dryRun {
-				log.Printf("[dry-run] would've closed scratch CL https://go.dev/cl/%d ...", cl.Number)
-				return nil
-			}
-			log.Printf("closing scratch CL https://go.dev/cl/%d ...", cl.Number)
-			err := b.gerrit.AbandonChange(ctx, fmt.Sprint(cl.Number), "Auto-abandoning old scratch review.")
-			if err != nil && strings.Contains(err.Error(), "404 Not Found") {
-				return nil
-			}
-			return err
-		})
+		if *dryRun {
+			log.Printf("[dry-run] would've closed scratch CL https://go.dev/cl/%d ...", cl.Number)
+			return nil
+		}
+		log.Printf("closing scratch CL https://go.dev/cl/%d ...", cl.Number)
+		err := b.gerrit.AbandonChange(ctx, fmt.Sprint(cl.Number), "Auto-abandoning old scratch review.")
+		if err != nil && strings.Contains(err.Error(), "404 Not Found") {
+			return nil
+		}
+		return err
 	})
 }
 

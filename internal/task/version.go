@@ -173,10 +173,7 @@ func nextVersion(version string) (string, error) {
 	return fmt.Sprintf("%s%d", version[:lastNonDigit+1], n+1), nil
 }
 
-func (t *VersionTasks) GenerateVersionFile(_ *workflow.TaskContext, distpack bool, version string, timestamp time.Time) (string, error) {
-	if !distpack {
-		return version, nil
-	}
+func (t *VersionTasks) GenerateVersionFile(_ *workflow.TaskContext, version string, timestamp time.Time) (string, error) {
 	return fmt.Sprintf("%v\ntime %v\n", version, timestamp.Format(time.RFC3339)), nil
 }
 
@@ -219,7 +216,7 @@ func (t *VersionTasks) TagRelease(ctx *workflow.TaskContext, version, commit str
 }
 
 func (t *VersionTasks) CreateUpdateStdlibIndexCL(ctx *workflow.TaskContext, reviewers []string, version string) (string, error) {
-	build, err := t.CloudBuild.RunScript(ctx, "go generate ./internal/imports", "tools", []string{"internal/imports/zstdlib.go"})
+	build, err := t.CloudBuild.RunScript(ctx, "go generate ./internal/stdlib", "tools", []string{"internal/stdlib/manifest.go"})
 	if err != nil {
 		return "", err
 	}
@@ -231,35 +228,8 @@ func (t *VersionTasks) CreateUpdateStdlibIndexCL(ctx *workflow.TaskContext, revi
 
 	changeInput := gerrit.ChangeInput{
 		Project: "tools",
-		Subject: fmt.Sprintf("internal/imports: update stdlib index for %s\n\nFor golang/go#38706.", strings.Replace(version, "go", "Go ", 1)),
+		Subject: fmt.Sprintf("internal/stdlib: update stdlib index for %s\n\nFor golang/go#38706.", strings.Replace(version, "go", "Go ", 1)),
 		Branch:  "master",
 	}
 	return t.Gerrit.CreateAutoSubmitChange(ctx, changeInput, reviewers, files)
-}
-
-// UnwaitWaitReleaseCLs changes all open Gerrit CLs with hashtag "wait-release" into "ex-wait-release".
-// This is done once at the opening of a release cycle, currently via a standalone workflow.
-func (t *VersionTasks) UnwaitWaitReleaseCLs(ctx *workflow.TaskContext) (result struct{}, _ error) {
-	waitingCLs, err := t.Gerrit.QueryChanges(ctx, "status:open hashtag:wait-release")
-	if err != nil {
-		return struct{}{}, nil
-	}
-	ctx.Printf("Processing %d open Gerrit CL with wait-release hashtag.", len(waitingCLs))
-	for _, cl := range waitingCLs {
-		const dryRun = false
-		if dryRun {
-			ctx.Printf("[dry run] Would've unwaited CL %d (%.32s…).", cl.ChangeNumber, cl.Subject)
-			continue
-		}
-		err := t.Gerrit.SetHashtags(ctx, cl.ID, gerrit.HashtagsInput{
-			Remove: []string{"wait-release"},
-			Add:    []string{"ex-wait-release"},
-		})
-		if err != nil {
-			return struct{}{}, err
-		}
-		ctx.Printf("Unwaited CL %d (%.32s…).", cl.ChangeNumber, cl.Subject)
-		time.Sleep(3 * time.Second) // Take a moment between updating CLs to avoid a high rate of modify operations.
-	}
-	return struct{}{}, nil
 }

@@ -80,10 +80,11 @@ func init() {
 	x("mod")
 	x("net", desc("additional networking packages"))
 	x("oauth2")
+	x("oscar", desc("open source contributor agent architecture"))
 	x("perf", desc("packages and tools for performance measurement, storage, and analysis"))
 	x("pkgsite", desc("home of the pkg.go.dev website"), enableCSR("go-discovery"))
 	x("pkgsite-metrics", desc("code for serving pkg.go.dev/metrics"), enableCSR("go-ecosystem"))
-	x("playground", noDash, enableCSR("golang-org"))
+	x("playground", enableCSR("golang-org"))
 	x("review", desc("a tool for working with Gerrit code reviews"))
 	x("scratch", noDash)
 	x("sync", desc("additional concurrency primitives"))
@@ -103,6 +104,13 @@ func init() {
 
 	add(&Repo{GoGerritProject: "gollvm"})
 	add(&Repo{GoGerritProject: "grpc-review"})
+
+	add(&Repo{
+		GoGerritProject: "open2opaque",
+		MirrorToGitHub:  true,
+		ImportPath:      "google.golang.org/open2opaque",
+		GitHubRepo:      "golang/open2opaque",
+	})
 
 	add(&Repo{
 		GoGerritProject: "protobuf",

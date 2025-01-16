@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.16 && (linux || darwin)
+//go:build linux || darwin
 
 package main
 
@@ -225,8 +225,8 @@ func TestXRepoBranches(t *testing.T) {
 		v := bs.NameAndBranch()
 		t.Logf("build[%d]: %s", i, v)
 	}
-	if len(ts.builds) < 3 {
-		t.Fatalf("expected at least 3 builders, got %v", len(ts.builds))
+	if len(ts.builds) == 0 {
+		t.Fatal("no builders in try set, want at least 1")
 	}
 }
 
@@ -433,24 +433,24 @@ func TestBuildStatusFormat(t *testing.T) {
 		{
 			st: &buildStatus{
 				BuilderRev: buildgo.BuilderRev{
-					Name: "darwin-amd64-10_14",
+					Name: "darwin-amd64-13",
 				},
 				commitDetail: commitDetail{
 					RevBranch: "master",
 				},
 			},
-			want: "darwin-amd64-10_14",
+			want: "darwin-amd64-13",
 		},
 		{
 			st: &buildStatus{
 				BuilderRev: buildgo.BuilderRev{
-					Name: "darwin-amd64-10_14",
+					Name: "darwin-amd64-13",
 				},
 				commitDetail: commitDetail{
 					RevBranch: "release-branch.go1.15",
 				},
 			},
-			want: "darwin-amd64-10_14 (Go 1.15.x)",
+			want: "darwin-amd64-13 (Go 1.15.x)",
 		},
 	} {
 		if got := tt.st.NameAndBranch(); got != tt.want {

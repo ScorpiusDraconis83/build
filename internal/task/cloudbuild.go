@@ -25,14 +25,26 @@ type CloudBuildClient interface {
 	// ScriptProject. Outputs are collected into the build's ResultURL,
 	// readable with ResultFS. The script will have the latest version of Go
 	// and some version of gsutil on $PATH.
-	// If gerritProject is specified, the script will run in the root of a
-	// checkout of the tip version of that repository.
+	// If gerritProject is provided, the script operates within a checkout of the
+	// latest commit on the default branch of that repository.
 	RunScript(ctx context.Context, script string, gerritProject string, outputs []string) (CloudBuild, error)
+	// RunCustomSteps is a low-level API that provides direct control over
+	// individual Cloud Build steps. It creates a random result directory
+	// and provides that as a parameter to the steps function, so that it
+	// may write output to it with 'gsutil cp' for accessing via ResultFS.
+	// Prefer RunScript for simpler scenarios.
+	// Reference: https://cloud.google.com/build/docs/build-config-file-schema
+	RunCustomSteps(ctx context.Context, steps func(resultURL string) []*cloudbuildpb.BuildStep, opts *CloudBuildOptions) (CloudBuild, error)
 	// Completed reports whether a build has finished, returning an error if
 	// it's failed. It's suitable for use with AwaitCondition.
 	Completed(ctx context.Context, build CloudBuild) (detail string, completed bool, _ error)
 	// ResultFS returns an FS that contains the results of the given build.
 	ResultFS(ctx context.Context, build CloudBuild) (fs.FS, error)
+}
+
+// CloudBuildOptions allows to customize CloudBuild configurations.
+type CloudBuildOptions struct {
+	AvailableSecrets *cloudbuildpb.Secrets
 }
 
 type RealCloudBuildClient struct {
@@ -71,49 +83,47 @@ func (c *RealCloudBuildClient) RunBuildTrigger(ctx context.Context, project, tri
 	return CloudBuild{Project: project, ID: meta.Build.Id}, nil
 }
 
-func (c *RealCloudBuildClient) RunScript(ctx context.Context, script string, gerritProject string, outputs []string) (CloudBuild, error) {
-	const downloadGoScript = `#!/usr/bin/env bash
+const cloudBuildClientScriptPrefix = `#!/usr/bin/env bash
+set -eux
+set -o pipefail
+export PATH=/workspace/released_go/bin:$PATH
+`
+
+const cloudBuildClientDownloadGoScript = `#!/usr/bin/env bash
 set -eux
 archive=$(wget -qO - 'https://go.dev/dl/?mode=json' | grep -Eo 'go.*linux-amd64.tar.gz' | head -n 1)
 wget -qO - https://go.dev/dl/${archive} | tar -xz
 mv go /workspace/released_go
 `
 
-	const scriptPrefix = `#!/usr/bin/env bash
-set -eux
-set -o pipefail
-export PATH=/workspace/released_go/bin:$PATH
-`
+func (c *RealCloudBuildClient) RunScript(ctx context.Context, script string, gerritProject string, outputs []string) (CloudBuild, error) {
+	steps := func(resultURL string) []*cloudbuildpb.BuildStep {
+		// Cloud build loses directory structure when it saves artifacts, which is
+		// a problem since (e.g.) we have multiple files named go.mod in the
+		// tagging tasks. It's not very complicated, so reimplement it ourselves.
+		var saveOutputsScript strings.Builder
+		saveOutputsScript.WriteString(cloudBuildClientScriptPrefix)
+		for _, out := range outputs {
+			saveOutputsScript.WriteString(fmt.Sprintf("gsutil cp %q %q\n", out, resultURL+"/"+strings.TrimPrefix(out, "./")))
+		}
 
-	// Cloud build loses directory structure when it saves artifacts, which is
-	// a problem since (e.g.) we have multiple files named go.mod in the
-	// tagging tasks. It's not very complicated, so reimplement it ourselves.
-	resultURL := fmt.Sprintf("%v/script-build-%v", c.ScratchURL, rand.Int63())
-	var saveOutputsScript strings.Builder
-	saveOutputsScript.WriteString(scriptPrefix)
-	for _, out := range outputs {
-		saveOutputsScript.WriteString(fmt.Sprintf("gsutil cp %q %q\n", out, resultURL+"/"+strings.TrimPrefix(out, "./")))
-	}
-
-	var steps []*cloudbuildpb.BuildStep
-	var dir string
-	if gerritProject != "" {
-		steps = append(steps, &cloudbuildpb.BuildStep{
-			Name: "gcr.io/cloud-builders/git",
-			Args: []string{"clone", "https://go.googlesource.com/" + gerritProject, "checkout"},
-		})
-		dir = "checkout"
-	}
-
-	build := &cloudbuildpb.Build{
-		Steps: append(steps,
+		var steps []*cloudbuildpb.BuildStep
+		var dir string
+		if gerritProject != "" {
+			steps = append(steps, &cloudbuildpb.BuildStep{
+				Name: "gcr.io/cloud-builders/git",
+				Args: []string{"clone", "https://go.googlesource.com/" + gerritProject, "checkout"},
+			})
+			dir = "checkout"
+		}
+		steps = append(steps,
 			&cloudbuildpb.BuildStep{
 				Name:   "bash",
-				Script: downloadGoScript,
+				Script: cloudBuildClientDownloadGoScript,
 			},
 			&cloudbuildpb.BuildStep{
 				Name:   "gcr.io/cloud-builders/gsutil",
-				Script: scriptPrefix + script,
+				Script: cloudBuildClientScriptPrefix + script,
 				Dir:    dir,
 			},
 			&cloudbuildpb.BuildStep{
@@ -121,12 +131,26 @@ export PATH=/workspace/released_go/bin:$PATH
 				Script: saveOutputsScript.String(),
 				Dir:    dir,
 			},
-		),
+		)
+
+		return steps
+	}
+
+	return c.RunCustomSteps(ctx, steps, nil)
+}
+
+func (c *RealCloudBuildClient) RunCustomSteps(ctx context.Context, steps func(resultURL string) []*cloudbuildpb.BuildStep, options *CloudBuildOptions) (CloudBuild, error) {
+	resultURL := fmt.Sprintf("%v/script-build-%v", c.ScratchURL, rand.Int63())
+	build := &cloudbuildpb.Build{
+		Steps: steps(resultURL),
 		Options: &cloudbuildpb.BuildOptions{
 			MachineType: cloudbuildpb.BuildOptions_E2_HIGHCPU_8,
 			Logging:     cloudbuildpb.BuildOptions_CLOUD_LOGGING_ONLY,
 		},
 		ServiceAccount: c.ScriptAccount,
+	}
+	if options != nil {
+		build.AvailableSecrets = options.AvailableSecrets
 	}
 	op, err := c.BuildClient.CreateBuild(ctx, &cloudbuildpb.CreateBuildRequest{
 		ProjectId: c.ScriptProject,
@@ -143,7 +167,6 @@ export PATH=/workspace/released_go/bin:$PATH
 		return CloudBuild{}, fmt.Errorf("reading metadata: %w", err)
 	}
 	return CloudBuild{Project: c.ScriptProject, ID: meta.Build.Id, ResultURL: resultURL}, nil
-
 }
 
 func (c *RealCloudBuildClient) Completed(ctx context.Context, build CloudBuild) (string, bool, error) {

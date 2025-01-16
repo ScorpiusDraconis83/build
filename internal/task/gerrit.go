@@ -5,10 +5,16 @@
 package task
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"golang.org/x/build/gerrit"
@@ -38,21 +44,30 @@ type GerritClient interface {
 	// ReadBranchHead returns the head of a branch in project.
 	// If the branch doesn't exist, it returns an error matching gerrit.ErrResourceNotExist.
 	ReadBranchHead(ctx context.Context, project, branch string) (string, error)
+	// ListBranches returns the branch info for all the branch in a project.
+	ListBranches(ctx context.Context, project string) ([]gerrit.BranchInfo, error)
+	// CreateBranch create the given branch and returns the created branch's revision.
+	CreateBranch(ctx context.Context, project, branch string, input gerrit.BranchInput) (string, error)
 	// ListProjects lists all the projects on the server.
 	ListProjects(ctx context.Context) ([]string, error)
 	// ReadFile reads a file from project at the specified commit.
 	// If the file doesn't exist, it returns an error matching gerrit.ErrResourceNotExist.
 	ReadFile(ctx context.Context, project, commit, file string) ([]byte, error)
+	// ReadDir reads a directory from project at the specified commit.
+	// If the directory doesn't exist, it returns an error matching gerrit.ErrResourceNotExist.
+	ReadDir(ctx context.Context, project, commit, dir string) ([]struct{ Name string }, error)
 	// GetCommitsInRefs gets refs in which the specified commits were merged into.
 	GetCommitsInRefs(ctx context.Context, project string, commits, refs []string) (map[string][]string, error)
 	// QueryChanges gets changes which match the query.
 	QueryChanges(ctx context.Context, query string) ([]*gerrit.ChangeInfo, error)
 	// SetHashtags modifies the hashtags for a CL.
 	SetHashtags(ctx context.Context, changeID string, hashtags gerrit.HashtagsInput) error
+	// GetChange gets information about a specific change.
+	GetChange(ctx context.Context, changeID string, opts ...gerrit.QueryChangesOpt) (*gerrit.ChangeInfo, error)
 }
 
 type RealGerritClient struct {
-	Gitiles string
+	Gitiles string // Gitiles server URL, without trailing slash. For example, "https://go.googlesource.com".
 	Client  *gerrit.Client
 }
 
@@ -107,6 +122,11 @@ func (c *RealGerritClient) CreateAutoSubmitChange(ctx *wf.TaskContext, input ger
 
 	var reviewerInputs []gerrit.ReviewerInput
 	for _, r := range reviewerEmails {
+		if r == "joedian@golang.org" {
+			// A temporary workaround for 'https://go-review.googlesource.com/accounts/joedian@golang.org' being 404.
+			// TODO(go.dev/issue/68276): Generalize this.
+			continue
+		}
 		reviewerInputs = append(reviewerInputs, gerrit.ReviewerInput{Reviewer: r})
 	}
 	if err := c.Client.SetReview(ctx, changeID, "current", gerrit.ReviewInput{
@@ -187,6 +207,18 @@ func (c *RealGerritClient) ReadBranchHead(ctx context.Context, project, branch s
 	return branchInfo.Revision, nil
 }
 
+func (c *RealGerritClient) ListBranches(ctx context.Context, project string) ([]gerrit.BranchInfo, error) {
+	return c.Client.ListBranches(ctx, project)
+}
+
+func (c *RealGerritClient) CreateBranch(ctx context.Context, project, branch string, input gerrit.BranchInput) (string, error) {
+	branchInfo, err := c.Client.CreateBranch(ctx, project, branch, input)
+	if err != nil {
+		return "", err
+	}
+	return branchInfo.Revision, nil
+}
+
 func (c *RealGerritClient) ListProjects(ctx context.Context) ([]string, error) {
 	projects, err := c.Client.ListProjects(ctx)
 	if err != nil {
@@ -208,6 +240,51 @@ func (c *RealGerritClient) ReadFile(ctx context.Context, project, commit, file s
 	return io.ReadAll(body)
 }
 
+func (c *RealGerritClient) ReadDir(ctx context.Context, project, commit, dir string) ([]struct{ Name string }, error) {
+	var resp struct {
+		Entries []struct{ Name string }
+	}
+	err := fetchGitilesJSON(ctx, c.Gitiles+"/"+url.PathEscape(project)+"/+/"+url.PathEscape(commit)+"/"+url.PathEscape(dir)+"?format=JSON", &resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+func fetchGitilesJSON(ctx context.Context, url string, v any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("get %q: %w", req.URL, gerrit.ErrResourceNotExist)
+	} else if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("did not get acceptable status code: %v body: %q", resp.Status, body)
+	}
+	if ct, want := resp.Header.Get("Content-Type"), "application/json"; ct != want {
+		log.Printf("fetchGitilesJSON: got response with non-'application/json' Content-Type header %q\n", ct)
+		if mediaType, _, err := mime.ParseMediaType(ct); err != nil {
+			return fmt.Errorf("bad Content-Type header %q: %v", ct, err)
+		} else if mediaType != "application/json" {
+			return fmt.Errorf("got media type %q, want %q", mediaType, "application/json")
+		}
+	}
+	const magicPrefix = ")]}'\n"
+	var buf = make([]byte, len(magicPrefix))
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		return err
+	} else if !bytes.Equal(buf, []byte(magicPrefix)) {
+		return fmt.Errorf("bad magic prefix")
+	}
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
 func (c *RealGerritClient) GetCommitsInRefs(ctx context.Context, project string, commits, refs []string) (map[string][]string, error) {
 	return c.Client.GetCommitsInRefs(ctx, project, commits, refs)
 }
@@ -224,6 +301,10 @@ func ChangeLink(changeID string) string {
 
 func (c *RealGerritClient) QueryChanges(ctx context.Context, query string) ([]*gerrit.ChangeInfo, error) {
 	return c.Client.QueryChanges(ctx, query)
+}
+
+func (c *RealGerritClient) GetChange(ctx context.Context, changeID string, opts ...gerrit.QueryChangesOpt) (*gerrit.ChangeInfo, error) {
+	return c.Client.GetChange(ctx, changeID, opts...)
 }
 
 func (c *RealGerritClient) SetHashtags(ctx context.Context, changeID string, hashtags gerrit.HashtagsInput) error {

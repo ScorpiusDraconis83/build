@@ -8,7 +8,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"reflect"
 	"runtime"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"go.chromium.org/luci/auth"
 	buildbucketpb "go.chromium.org/luci/buildbucket/proto"
 	"go.chromium.org/luci/grpc/prpc"
+	"go.chromium.org/luci/hardcoded/chromeinfra"
 	"golang.org/x/build/gerrit"
 	"golang.org/x/build/internal/workflow"
 	wf "golang.org/x/build/internal/workflow"
@@ -142,26 +142,24 @@ var flagRunFindMissingBuildersLiveTest = flag.String("run-find-missing-builders-
 var flagRunMissingBuilds = flag.Bool("run-missing-builds", false, "run missing builds from missing builders test")
 
 func TestFindMissingBuildersLive(t *testing.T) {
-	if *flagRunFindMissingBuildersLiveTest == "" {
-		t.Skip("no module/rev specified")
+	if !testing.Verbose() || flag.Lookup("test.run").Value.String() != "^TestFindMissingBuildersLive$" {
+		t.Skip("not running a live test requiring manual verification if not explicitly requested with go test -v -run=^TestFindMissingBuildersLive$")
 	}
-
 	repo, commit, ok := strings.Cut(*flagRunFindMissingBuildersLiveTest, "@")
 	if !ok {
-		t.Fatalf("--run-find-missing-builders-test must be module@rev: %q", *flagRunFindMissingBuildersLiveTest)
+		t.Fatalf("-run-find-missing-builders-test flag must be module@rev: %q", *flagRunFindMissingBuildersLiveTest)
 	}
 
 	ctx := &workflow.TaskContext{Context: context.Background(), Logger: &testLogger{t, ""}}
-
-	luciHTTPClient, err := auth.NewAuthenticator(ctx, auth.SilentLogin, auth.Options{GCEAllowAsDefault: true}).Client()
+	luciHTTPClient, err := auth.NewAuthenticator(ctx, auth.SilentLogin, chromeinfra.DefaultAuthOptions()).Client()
 	if err != nil {
-		log.Fatal(err)
+		t.Fatal("auth.NewAuthenticator:", err)
 	}
-	buildsClient := buildbucketpb.NewBuildsPRPCClient(&prpc.Client{
+	buildsClient := buildbucketpb.NewBuildsClient(&prpc.Client{
 		C:    luciHTTPClient,
 		Host: "cr-buildbucket.appspot.com",
 	})
-	buildersClient := buildbucketpb.NewBuildersPRPCClient(&prpc.Client{
+	buildersClient := buildbucketpb.NewBuildersClient(&prpc.Client{
 		C:    luciHTTPClient,
 		Host: "cr-buildbucket.appspot.com",
 	})
@@ -226,27 +224,6 @@ func TestAwaitGreen(t *testing.T) {
 	}
 }
 
-const fakeGo = `#!/bin/bash -exu
-
-case "$1" in
-"get")
-  ls go.mod go.sum >/dev/null
-  for i in "${@:2}"; do
-    echo -e "// pretend we've upgraded to $i" >> go.mod
-    echo "$i h1:asdasd" | tr '@' ' ' >> go.sum
-  done
-  ;;
-"mod")
-  ls go.mod go.sum >/dev/null
-  echo "tidied! $*" >> go.mod
-  ;;
-*)
-  echo unexpected command $@
-  exit 1
-  ;;
-esac
-`
-
 type tagXTestDeps struct {
 	ctx         *wf.TaskContext
 	gerrit      *FakeGerrit
@@ -263,6 +240,38 @@ func mustHaveShell(t *testing.T) {
 }
 
 func newTagXTestDeps(t *testing.T, repos ...*FakeRepo) *tagXTestDeps {
+	const fakeGo = `#!/bin/bash -exu
+
+case "$1" in
+"get")
+	ls go.mod go.sum >/dev/null
+	for i in "${@:2}"; do
+		if [ "$i" = "toolchain@none" ]; then
+			echo "// pretend we've dropped toolchain directive" >> go.mod
+		else
+			echo "// pretend we've upgraded to $i" >> go.mod
+			echo "$i h1:asdasd" | tr '@' ' ' >> go.sum
+		fi
+	done
+	;;
+"mod")
+	case "$2" in
+	"tidy")
+		ls go.mod go.sum >/dev/null
+		echo "tidied! $*" >> go.mod
+		;;
+	"edit")
+		echo "edited! $*" >> go.mod
+		;;
+	esac
+	;;
+*)
+	echo unexpected command $@
+	exit 1
+	;;
+esac
+`
+
 	mustHaveShell(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -276,7 +285,7 @@ func newTagXTestDeps(t *testing.T, repos ...*FakeRepo) *tagXTestDeps {
 	fakeBuildBucket := NewFakeBuildBucketClient(0, fakeGerrit.GerritURL(), "ci", projects)
 	tasks := &TagXReposTasks{
 		Gerrit:      fakeGerrit,
-		CloudBuild:  NewFakeCloudBuild(t, fakeGerrit, "project", nil, fakeGo),
+		CloudBuild:  NewFakeCloudBuild(t, fakeGerrit, "project", nil, FakeBinary{Name: "go", Implementation: fakeGo}),
 		BuildBucket: fakeBuildBucket,
 	}
 	return &tagXTestDeps{
@@ -305,10 +314,11 @@ func TestTagXRepos(t *testing.T) {
 	mod.Tag("v1.0.0", mod1)
 	tools := NewFakeRepo(t, "tools")
 	tools1 := tools.Commit(map[string]string{
-		"go.mod":       "module golang.org/x/tools\nrequire golang.org/x/mod v1.0.0\ngo 1.18 // tagx:compat 1.16\nrequire golang.org/x/sys v0.1.0\nrequire golang.org/x/build v0.0.0\n",
-		"go.sum":       "\n",
-		"gopls/go.mod": "module golang.org/x/tools/gopls\nrequire golang.org/x/mod v1.0.0\n",
-		"gopls/go.sum": "\n",
+		"go.mod":               "module golang.org/x/tools\nrequire golang.org/x/mod v1.0.0\ngo 1.18\nrequire golang.org/x/sys v0.1.0\nrequire golang.org/x/build v0.0.0\n",
+		"go.sum":               "\n",
+		"gopls/go.mod":         "module golang.org/x/tools/gopls\nrequire golang.org/x/mod v1.0.0\n",
+		"gopls/go.sum":         "\n",
+		"withtoolchain/go.mod": "module golang.org/x/tools/withtoolchain\ngo 1.23.1\ntoolchain go1.23.2\n",
 	})
 	tools.Tag("v1.1.5", tools1)
 	build := NewFakeRepo(t, "build")
@@ -362,12 +372,22 @@ func TestTagXRepos(t *testing.T) {
 	if !strings.Contains(string(goMod), "tidied!") {
 		t.Error("tools go.mod should be tidied")
 	}
+	if !strings.Contains(string(goMod), "edited! mod edit -toolchain=none") {
+		t.Error("tools go.mod should be edited with -toolchain=none")
+	}
 	goplsMod, err := deps.gerrit.ReadFile(ctx, "tools", tag.Revision, "gopls/go.mod")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(goplsMod), "tidied!") || !strings.Contains(string(goplsMod), "1.16") || strings.Contains(string(goplsMod), "upgraded") {
-		t.Error("gopls go.mod should be tidied with -compat 1.16, but not upgraded")
+	if !strings.Contains(string(goplsMod), "tidied!") || !strings.Contains(string(goplsMod), "edited!") || strings.Contains(string(goplsMod), "upgraded") {
+		t.Errorf("gopls go.mod should be tidied+edited and not upgraded:\n%s", goplsMod)
+	}
+	withtoolchainMod, err := deps.gerrit.ReadFile(ctx, "tools", tag.Revision, "withtoolchain/go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(withtoolchainMod), "tidied!") || strings.Contains(string(withtoolchainMod), "edited!") {
+		t.Errorf("withtoolchain go.mod should be tidied and not edited:\n%s", withtoolchainMod)
 	}
 
 	tags, err = deps.gerrit.ListTags(ctx, "build")
@@ -453,10 +473,14 @@ func TestTagSingleRepo(t *testing.T) {
 type verboseListener struct {
 	t              *testing.T
 	outputListener func(string, interface{})
+	onStall        func()
 }
 
 func (l *verboseListener) WorkflowStalled(workflowID uuid.UUID) error {
 	l.t.Logf("workflow %q: stalled", workflowID.String())
+	if l.onStall != nil {
+		l.onStall()
+	}
 	return nil
 }
 
