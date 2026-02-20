@@ -118,10 +118,10 @@ type BuildResult struct {
 	BuildTime time.Time // build end time
 	Builder   string
 	*BuilderConfigProperties
-	InvocationID string // ResultDB invocation ID
-	LogURL       string // textual log of the whole run
-	LogText      string
-	StepLogURL   string // textual log of the (last) failed step, if any
+	InvocationID string   // ResultDB invocation ID
+	LogURL       []string // textual log of the whole run, can be multiple if multiple shards failed
+	LogText      string   // concatenated log
+	StepLogURL   string   // textual log of the (last) failed step, if any
 	StepLogText  string
 	Failures     []*Failure
 	Top          bool // whether this is a consistent failure at the top (tip)
@@ -466,19 +466,23 @@ func (c *LUCIClient) GetBuildResult(ctx context.Context, repo string, builder Bu
 	if r.Status == bbpb.Status_FAILURE {
 		links := prop["failure"].GetStructValue().GetFields()["links"].GetListValue().GetValues()
 		for _, l := range links {
+			// We used to filter m["name"] and look for "(combined output)",
+			// but something changed on the LUCI side, now the names are
+			// like "go tool dist test -json output [shard 1]" or
+			// "test golang.org/x/tools/gopls module output".
+			// Apparently, all the links are relevant (as of 2026-02-20).
+			// And there can be multiple links when multiple shards failing.
+			// So we just keep them all.
 			m := l.GetStructValue().GetFields()
-			if strings.Contains(m["name"].GetStringValue(), "(combined output)") {
-				r.LogURL = m["url"].GetStringValue()
-				break
-			}
+			r.LogURL = append(r.LogURL, m["url"].GetStringValue())
 		}
-		if r.LogURL == "" {
-			// No log URL, Probably a build failure.
+		if len(r.LogURL) == 0 {
+			// No log URL, probably a build failure.
 			// E.g. https://ci.chromium.org/ui/b/8759448820419452721
 			// Use the build's stderr instead.
 			for _, l := range b.GetOutput().GetLogs() {
 				if l.GetName() == "stderr" {
-					r.LogURL = l.GetViewUrl()
+					r.LogURL = []string{l.GetViewUrl()}
 					break
 				}
 			}
@@ -714,10 +718,12 @@ func (c *LUCIClient) fetchLogsForBuild(r *BuildResult) {
 	if c.TraceSteps {
 		log.Println("fetchLogsForBuild", r.Builder, shortHash(r.Commit), r.ID)
 	}
-	if r.LogURL == "" {
+	if len(r.LogURL) == 0 {
 		fmt.Printf("no log url: %s\n", buildURL(r.ID))
 	} else {
-		r.LogText = fetchURL(r.LogURL + "?format=raw")
+		for _, u := range r.LogURL {
+			r.LogText += fetchURL(u + "?format=raw")
+		}
 	}
 	if r.StepLogURL != "" {
 		r.StepLogText = fetchURL(r.StepLogURL + "?format=raw")
