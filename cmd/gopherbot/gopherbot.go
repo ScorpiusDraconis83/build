@@ -1933,6 +1933,12 @@ func (b *gopherbot) closeCherryPickIssues(ctx context.Context) error {
 					// doesn't match the CL branch goX.Y version, so skip it.
 					continue
 				}
+				if !strings.Contains(cl.Commit.Msg, fmt.Sprintf("\nFixes #%d", gi.Number)) &&
+					!strings.Contains(cl.Commit.Msg, fmt.Sprintf("\nFixes golang/go#%d", gi.Number)) {
+					// The commit message had something like "For #123.", not "Fixes #123.",
+					// so skip it.
+					continue
+				}
 				if issueLastOpened(gi).After(cl.Commit.CommitTime) {
 					// The issue was opened (or more likely, reopened) after this CL was submitted,
 					// so skip it.
