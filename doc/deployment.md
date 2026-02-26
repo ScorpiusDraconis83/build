@@ -15,6 +15,7 @@ You should have `gcloud` and `kubectl` available in PATH.
 First, configure `gcloud` to target our production environment:
 
 ```sh
+$ gcloud auth application-default login
 $ gcloud config set project symbolic-datum-552
 $ gcloud container clusters get-credentials --zone=us-central1 services
 ```
